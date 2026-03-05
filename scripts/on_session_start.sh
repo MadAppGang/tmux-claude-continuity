@@ -7,7 +7,7 @@
 #
 # Skips subagent sessions (e.g. claudish-spawned instances) by detecting:
 #   1. agent_type field in the SessionStart JSON (set when --agent flag is used)
-#   2. Parent process is another claude instance (nested/subagent execution)
+#   2. CLAUDISH_ACTIVE_MODEL_NAME env var (always set by claudish to the active model name)
 #
 # Add to ~/.claude/settings.json:
 #
@@ -32,9 +32,8 @@ input="$(cat)"
 agent_type="$(echo "$input" | jq -r '.agent_type // empty' 2>/dev/null)"
 [ -n "$agent_type" ] && exit 0
 
-# Signal 2: parent process is claude → we are a nested/subagent instance
-parent_cmd="$(ps -p "$PPID" -o comm= 2>/dev/null)"
-[ "$parent_cmd" = "claude" ] && exit 0
+# Signal 2: CLAUDISH_ACTIVE_MODEL_NAME is set → running inside claudish proxy
+[ -n "$CLAUDISH_ACTIVE_MODEL_NAME" ] && exit 0
 
 # ── Capture session ID ────────────────────────────────────────────────────────
 
