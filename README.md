@@ -13,7 +13,7 @@ set -g @plugin 'MadAppGang/tmux-claude-continuity'
 
 Press `prefix + I` to install.
 
-**Step 2.** Register the `SessionStart` hook in `~/.claude/settings.json`:
+**Step 2.** Register the hooks in `~/.claude/settings.json`:
 
 ```json
 {
@@ -24,6 +24,16 @@ Press `prefix + I` to install.
           {
             "type": "command",
             "command": "bash ~/.tmux/plugins/tmux-claude-continuity/scripts/on_session_start.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.tmux/plugins/tmux-claude-continuity/scripts/on_stop.sh"
           }
         ]
       }
@@ -46,9 +56,11 @@ You can recover manually with `claude --resume <uuid>`, but first you have to fi
 
 tmux-claude-continuity does that bookkeeping for you.
 
-Every time Claude Code starts a session (new, resumed, cleared, or compacted), its `SessionStart` hook fires a small script that writes the session UUID to a file named after the pane's position: `~/.config/tmux-claude/panes/<session>-<window>-<pane>.session-id`.
+Every time Claude Code starts a session (new, resumed, cleared, or compacted), its `SessionStart` hook writes a resume token to a file named after the pane's position: `~/.config/tmux-claude/panes/<session>-<window>-<pane>.session-id`.
 
-After tmux-resurrect restores, a post-restore hook reads those files and sends `claude --resume <uuid>` to each pane that was running Claude.
+If you named your session with `/title`, the token is that name. Otherwise it is the session UUID. The `Stop` hook keeps the token updated after every turn, so `/title` changes take effect immediately.
+
+After tmux-resurrect restores, a post-restore hook reads those files and sends `claude --resume <token>` to each pane that was running Claude.
 
 ## How it works
 
@@ -56,13 +68,17 @@ After tmux-resurrect restores, a post-restore hook reads those files and sends `
 Claude Code starts in pane  work:1.0
   └── SessionStart hook fires
       └── writes  ~/.config/tmux-claude/panes/work-1-0.session-id
-                  (contains the session UUID)
+                  (contains session UUID, or custom title if /title was used)
+
+User types /title bugfix-sentry
+  └── Stop hook fires after the turn
+      └── updates  work-1-0.session-id  →  "bugfix-sentry"
 
 You restore tmux with tmux-resurrect
   └── post_restore.sh fires after all panes are recreated
       ├── reads the resurrect save file
       ├── finds panes that were running claude
-      └── sends  claude --resume <uuid>  to each one
+      └── sends  claude --resume bugfix-sentry  (or --resume <uuid>)  to each one
 ```
 
 ### Why pane identity survives restore
@@ -112,9 +128,9 @@ run-shell ~/.tmux/plugins/tmux-claude-continuity/tmux-claude-continuity.tmux
 
 ## Configuration
 
-### Claude Code hook (required)
+### Claude Code hooks (required)
 
-The hook goes in `~/.claude/settings.json`, not `~/.tmux.conf`. This is the step most users miss.
+The hooks go in `~/.claude/settings.json`, not `~/.tmux.conf`. This is the step most users miss.
 
 ```json
 {
@@ -128,12 +144,24 @@ The hook goes in `~/.claude/settings.json`, not `~/.tmux.conf`. This is the step
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.tmux/plugins/tmux-claude-continuity/scripts/on_stop.sh"
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
-If you already have a `hooks` key in `settings.json`, add `SessionStart` alongside your existing hooks.
+`SessionStart` captures the session on startup. `Stop` keeps the resume token updated after every turn — required for `/title` changes to take effect without restarting.
+
+If you already have a `hooks` key in `settings.json`, add `SessionStart` and `Stop` alongside your existing hooks.
 
 ### tmux.conf options (all optional)
 

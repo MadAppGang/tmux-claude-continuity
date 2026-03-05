@@ -47,4 +47,21 @@ panes_dir="$(tmux show-option -gqv @claude-continuity-panes-dir 2>/dev/null)"
 panes_dir="${panes_dir:-$HOME/.config/tmux-claude/panes}"
 
 mkdir -p "$panes_dir"
-echo "$session_id" > "${panes_dir}/${pane_key}.session-id"
+
+# ── Look up customTitle from session JSONL (set via /title or session rename) ──
+cwd="$(echo "$input" | jq -r '.cwd // empty' 2>/dev/null)"
+custom_title=""
+if [ -n "$cwd" ]; then
+  project_key="$(echo "$cwd" | sed 's|/|-|g')"
+  jsonl="$HOME/.claude/projects/${project_key}/${session_id}.jsonl"
+  if [ -f "$jsonl" ]; then
+    custom_title="$(grep -m1 '"custom-title"' "$jsonl" 2>/dev/null | jq -r '.customTitle // empty' 2>/dev/null)"
+  fi
+fi
+
+# Write title if set, UUID otherwise
+if [ -n "$custom_title" ]; then
+  echo "$custom_title" > "${panes_dir}/${pane_key}.session-id"
+else
+  echo "$session_id" > "${panes_dir}/${pane_key}.session-id"
+fi

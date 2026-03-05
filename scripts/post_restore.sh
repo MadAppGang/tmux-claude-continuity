@@ -45,12 +45,11 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
     continue
   fi
 
-  session_id="$(cat "$metadata_file")"
+  resume_token="$(cat "$metadata_file")"
 
-  # Validate UUID v4 format before using
-  if [[ "$session_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+  if [ -n "$resume_token" ]; then
     tmux send-keys -t "${session}:${win}.${pane_idx}" \
-      "claude --resume ${session_id} ${claude_flags}" "Enter"
+      "claude --resume ${resume_token} ${claude_flags}" "Enter"
   else
     tmux send-keys -t "${session}:${win}.${pane_idx}" \
       "claude ${claude_flags}" "Enter"
