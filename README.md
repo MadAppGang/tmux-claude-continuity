@@ -2,59 +2,18 @@
 
 Automatically resume Claude Code sessions after [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect) restore.
 
-When tmux-resurrect restores your sessions, Claude Code instances are killed and you lose track of which session was running in which pane. This plugin solves that by capturing each pane's Claude Code session ID at startup and resuming the correct session automatically after restore.
+## Quick start
 
-## How it works
-
-1. **Capture** — Claude Code's `SessionStart` hook fires when a session starts. The plugin writes the session UUID to a per-pane file keyed by stable pane identity (`session-window-pane`).
-2. **Restore** — After tmux-resurrect restores all panes, a post-restore hook reads each pane's saved UUID and runs `claude --resume <uuid>` in the correct pane.
-
-```
-claude starts in pane circl:1.0
-  → SessionStart hook fires
-  → writes ~/.config/tmux-claude/panes/circl-1-0.session-id
-
-tmux-resurrect restores
-  → post_restore.sh reads save file
-  → sends "claude --resume <uuid>" to each claude pane
-```
-
-## Requirements
-
-- [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect)
-- [tmux-continuum](https://github.com/tmux-plugins/tmux-continuum) (optional, for automatic saves)
-- [jq](https://jqlang.github.io/jq/)
-- Claude Code >= 2.0
-
-## Installation
-
-### With [TPM](https://github.com/tmux-plugins/tpm)
-
-Add to `~/.tmux.conf`:
+**Step 1.** Install the plugin (TPM):
 
 ```tmux
+set -g @plugin 'tmux-plugins/tmux-resurrect'
 set -g @plugin 'MadAppGang/tmux-claude-continuity'
 ```
 
-Then press `prefix + I` to install.
+Press `prefix + I` to install.
 
-### Manual
-
-```bash
-git clone https://github.com/MadAppGang/tmux-claude-continuity ~/.tmux/plugins/tmux-claude-continuity
-```
-
-Add to `~/.tmux.conf`:
-
-```tmux
-run-shell ~/.tmux/plugins/tmux-claude-continuity/tmux-claude-continuity.tmux
-```
-
-## Configuration
-
-### 1. Register the SessionStart hook in Claude Code
-
-Add to `~/.claude/settings.json`:
+**Step 2.** Register the `SessionStart` hook in `~/.claude/settings.json`:
 
 ```json
 {
@@ -73,54 +32,159 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-### 2. tmux.conf options
+Done. Next time tmux-resurrect restores your sessions, Claude Code resumes where you left off.
 
-All options are optional — defaults work out of the box.
+---
+
+## The problem
+
+You run Claude Code in a tmux pane. You save your tmux session with tmux-resurrect, then restore it — maybe after a reboot or a `tmux kill-server`. tmux-resurrect recreates your pane layout and reruns the shell command. But Claude Code starts a brand-new session, not the one you were in. Your conversation context is gone.
+
+You can recover manually with `claude --resume <uuid>`, but first you have to find the right UUID — and if you had Claude running in several panes, you have to match each UUID to the correct pane.
+
+## The solution
+
+tmux-claude-continuity does that bookkeeping for you.
+
+Every time Claude Code starts a session (new, resumed, cleared, or compacted), its `SessionStart` hook fires a small script that writes the session UUID to a file named after the pane's position: `~/.config/tmux-claude/panes/<session>-<window>-<pane>.session-id`.
+
+After tmux-resurrect restores, a post-restore hook reads those files and sends `claude --resume <uuid>` to each pane that was running Claude.
+
+## How it works
+
+```
+Claude Code starts in pane  work:1.0
+  └── SessionStart hook fires
+      └── writes  ~/.config/tmux-claude/panes/work-1-0.session-id
+                  (contains the session UUID)
+
+You restore tmux with tmux-resurrect
+  └── post_restore.sh fires after all panes are recreated
+      ├── reads the resurrect save file
+      ├── finds panes that were running claude
+      └── sends  claude --resume <uuid>  to each one
+```
+
+### Why pane identity survives restore
+
+Each pane is keyed by `session_name-window_index-pane_index` (e.g. `work-1-0`). tmux-resurrect recreates panes at exactly these positions, so the key written before a save matches the pane address after restore. The ephemeral `%N` numeric pane ID — which changes every session — is never used.
+
+---
+
+## Requirements
+
+- [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect)
+- [jq](https://jqlang.github.io/jq/)
+- Claude Code >= 2.0
+
+**Optional:** [tmux-continuum](https://github.com/tmux-plugins/tmux-continuum) for automatic periodic saves.
+
+---
+
+## Installation
+
+### TPM (recommended)
+
+Add to `~/.tmux.conf` in this order — tmux-resurrect must load before this plugin:
 
 ```tmux
-# Directory where per-pane session ID files are stored
+set -g @plugin 'tmux-plugins/tmux-resurrect'
+set -g @plugin 'tmux-plugins/tmux-continuum'  # optional
+set -g @plugin 'MadAppGang/tmux-claude-continuity'
+```
+
+Press `prefix + I` to install.
+
+### Manual
+
+```bash
+git clone https://github.com/MadAppGang/tmux-claude-continuity \
+  ~/.tmux/plugins/tmux-claude-continuity
+```
+
+Add to `~/.tmux.conf` after the tmux-resurrect line:
+
+```tmux
+run-shell ~/.tmux/plugins/tmux-claude-continuity/tmux-claude-continuity.tmux
+```
+
+---
+
+## Configuration
+
+### Claude Code hook (required)
+
+The hook goes in `~/.claude/settings.json`, not `~/.tmux.conf`. This is the step most users miss.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.tmux/plugins/tmux-claude-continuity/scripts/on_session_start.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+If you already have a `hooks` key in `settings.json`, add `SessionStart` alongside your existing hooks.
+
+### tmux.conf options (all optional)
+
+```tmux
+# Where per-pane session ID files are stored
 # Default: ~/.config/tmux-claude/panes
 set -g @claude-continuity-panes-dir "$HOME/.config/tmux-claude/panes"
 
-# Seconds to wait after restore before sending keys (let shells finish init)
+# Seconds to wait after restore before sending keys
+# Increase if your shell init is slow
 # Default: 1
 set -g @claude-continuity-restore-delay "1"
 
-# Flags appended to the restored claude command
+# Flags appended to every restored claude command
 # Default: --dangerously-skip-permissions
 set -g @claude-continuity-claude-flags "--dangerously-skip-permissions"
 ```
 
-### 3. Ensure tmux-resurrect is loaded before this plugin
-
-```tmux
-set -g @plugin 'tmux-plugins/tmux-resurrect'
-set -g @plugin 'tmux-plugins/tmux-continuum'
-set -g @plugin 'MadAppGang/tmux-claude-continuity'
-```
-
-## How pane identity works
-
-Panes are identified by `session_name-window_index-pane_index` (e.g. `work-1-0`). This triple is stable across tmux-resurrect restore — resurrect explicitly recreates panes at the same positions. The ephemeral `%N` numeric pane ID is not used.
+---
 
 ## Troubleshooting
 
-**Sessions not resuming after restore**
+### Sessions not resuming after restore
 
-Check that sidecar files are being written:
+Check whether the sidecar files exist:
+
 ```bash
 ls ~/.config/tmux-claude/panes/
+# Expected: work-1-0.session-id  work-2-0.session-id  ...
 ```
-Files should appear after Claude Code's first API response in each pane. If the directory is empty, verify the `SessionStart` hook is configured in `~/.claude/settings.json`.
 
-**Wrong session resumed**
+Files appear after Claude Code's first API response in each pane (that is when `SessionStart` fires). An empty directory means the hook is not running. Verify `~/.claude/settings.json` contains the `SessionStart` entry shown above, then restart Claude Code.
 
-The sidecar file is updated on every `SessionStart` event (startup, resume, clear, compact), so it always reflects the most recent session in each pane.
+### Restore starts a fresh session instead of resuming
 
-**Fresh session started instead of resume**
+This happens when no sidecar file exists for a pane — for example, a pane that never ran Claude before or a new pane added after the last save. The plugin falls back to `claude <flags>`, starting a fresh session.
 
-If no sidecar file exists for a pane (e.g. the pane never ran Claude Code before), the plugin falls back to starting a fresh `claude` session.
+### Wrong session resumed
+
+The sidecar file updates on every `SessionStart` event (startup, resume, clear, compact), so it always reflects the most recent session in that pane. If you see a wrong session resumed, the save was taken before a session switch; save again with `prefix + C-s` to capture the current state.
+
+### Restore delay too short
+
+If Claude starts before your shell finishes sourcing rc files, increase the delay:
+
+```tmux
+set -g @claude-continuity-restore-delay "3"
+```
+
+---
 
 ## License
 
-MIT
+MIT — [MadAppGang](https://github.com/MadAppGang/tmux-claude-continuity)
