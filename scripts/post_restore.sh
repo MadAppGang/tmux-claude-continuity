@@ -18,6 +18,9 @@ restore_delay="${restore_delay:-1}"
 claude_flags="$(tmux show-option -gqv @claude-continuity-claude-flags 2>/dev/null)"
 claude_flags="${claude_flags:---dangerously-skip-permissions}"
 
+claude_cmd="$(tmux show-option -gqv @claude-continuity-claude-cmd 2>/dev/null)"
+claude_cmd="${claude_cmd:-claude}"
+
 if [ ! -f "$RESURRECT_FILE" ]; then
   exit 0
 fi
@@ -32,8 +35,8 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   # Strip leading ":" sentinel from full command field
   full_cmd="${pane_full_cmd#:}"
 
-  # Only act on panes that were running claude
-  [[ "$full_cmd" == *"claude"* ]] || continue
+  # Only act on panes that were running claude (or custom alias)
+  [[ "$full_cmd" == *"claude"* ]] || [[ "$full_cmd" == *"$claude_cmd"* ]] || continue
 
   pane_key="${session}-${win}-${pane_idx}"
   metadata_file="${panes_dir}/${pane_key}.session-id"
@@ -49,10 +52,10 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
 
   if [ -n "$resume_token" ]; then
     tmux send-keys -t "${session}:${win}.${pane_idx}" \
-      "claude --resume ${resume_token} ${claude_flags}" "Enter"
+      "${claude_cmd} --resume ${resume_token} ${claude_flags}" "Enter"
   else
     tmux send-keys -t "${session}:${win}.${pane_idx}" \
-      "claude ${claude_flags}" "Enter"
+      "${claude_cmd} ${claude_flags}" "Enter"
   fi
 
 done < "$RESURRECT_FILE"

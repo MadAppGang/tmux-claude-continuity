@@ -178,6 +178,11 @@ set -g @claude-continuity-restore-delay "1"
 # Flags appended to every restored claude command
 # Default: --dangerously-skip-permissions
 set -g @claude-continuity-claude-flags "--dangerously-skip-permissions"
+
+# Command used to launch Claude Code
+# Use this if you have a shell alias (e.g. 'c' for claude in yolo mode)
+# Default: claude
+set -g @claude-continuity-claude-cmd "claude"
 ```
 
 ---
