@@ -4,8 +4,8 @@
 # Triggered by: @resurrect-hook-post-restore-all (restore.sh:382, undocumented)
 # Fires after all panes, processes, zoom states, and sessions are restored.
 #
-# For each pane that was running claude, reads the saved session ID from the
-# per-pane sidecar file and sends `claude --resume <uuid>` to that pane.
+# For each pane that was running claude, reads the saved resume token from the
+# per-pane sidecar file and sends `<claude_cmd> --resume <token>` to that pane.
 
 RESURRECT_FILE="$HOME/.local/share/tmux/resurrect/last"
 
@@ -14,9 +14,6 @@ panes_dir="${panes_dir:-$HOME/.config/tmux-claude/panes}"
 
 restore_delay="$(tmux show-option -gqv @claude-continuity-restore-delay 2>/dev/null)"
 restore_delay="${restore_delay:-1}"
-
-claude_flags="$(tmux show-option -gqv @claude-continuity-claude-flags 2>/dev/null)"
-claude_flags="${claude_flags:---dangerously-skip-permissions}"
 
 claude_cmd="$(tmux show-option -gqv @claude-continuity-claude-cmd 2>/dev/null)"
 claude_cmd="${claude_cmd:-claude}"
@@ -42,9 +39,7 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   metadata_file="${panes_dir}/${pane_key}.session-id"
 
   if [ ! -f "$metadata_file" ]; then
-    # No saved session ID — start fresh
-    tmux send-keys -t "${session}:${win}.${pane_idx}" \
-      "claude ${claude_flags}" "Enter"
+    tmux send-keys -t "${session}:${win}.${pane_idx}" "$claude_cmd" "Enter"
     continue
   fi
 
@@ -52,10 +47,9 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
 
   if [ -n "$resume_token" ]; then
     tmux send-keys -t "${session}:${win}.${pane_idx}" \
-      "${claude_cmd} --resume ${resume_token} ${claude_flags}" "Enter"
+      "${claude_cmd} --resume ${resume_token}" "Enter"
   else
-    tmux send-keys -t "${session}:${win}.${pane_idx}" \
-      "${claude_cmd} ${claude_flags}" "Enter"
+    tmux send-keys -t "${session}:${win}.${pane_idx}" "$claude_cmd" "Enter"
   fi
 
 done < "$RESURRECT_FILE"
