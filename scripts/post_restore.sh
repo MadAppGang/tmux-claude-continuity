@@ -25,6 +25,21 @@ fi
 # Give shells time to finish sourcing rc files after restore
 sleep "$restore_delay"
 
+# Build set of all pane keys present in the resurrect file
+declare -A known_panes
+while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx _rest; do
+  [ "$line_type" = "pane" ] || continue
+  known_panes["${session}-${win}-${pane_idx}"]=1
+done < "$RESURRECT_FILE"
+
+# Remove sidecar files for panes that no longer exist
+for sidecar in "${panes_dir}"/*.session-id; do
+  [ -f "$sidecar" ] || continue
+  key="$(basename "$sidecar" .session-id)"
+  [ "${known_panes[$key]+_}" ] || rm -f "$sidecar"
+done
+
+# Resume claude in panes that were running it
 while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
         pane_title dir pane_active pane_cmd pane_full_cmd; do
   [ "$line_type" = "pane" ] || continue
