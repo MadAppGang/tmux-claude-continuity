@@ -29,7 +29,7 @@ session_id="$(echo "$input" | jq -r '.session_id // empty' 2>/dev/null)"
 cwd="$(echo "$input" | jq -r '.cwd // empty' 2>/dev/null)"
 [ -n "$cwd" ] || exit 0
 
-pane_key="$(tmux display-message -p '#S-#I-#P' 2>/dev/null)"
+pane_key="$(tmux display-message -t "${TMUX_PANE:-}" -p '#S-#I-#P' 2>/dev/null)"
 [ -n "$pane_key" ] || exit 0
 
 panes_dir="$(tmux show-option -gqv @claude-continuity-panes-dir 2>/dev/null)"
@@ -38,12 +38,14 @@ panes_dir="${panes_dir:-$HOME/.config/tmux-claude/panes}"
 metadata_file="${panes_dir}/${pane_key}.session-id"
 [ -f "$metadata_file" ] || exit 0
 
-# Read customTitle from session JSONL
+# Read customTitle from session JSONL (if it exists)
 project_key="$(echo "$cwd" | sed 's|/|-|g')"
 jsonl="$HOME/.claude/projects/${project_key}/${session_id}.jsonl"
-[ -f "$jsonl" ] || exit 0
 
-custom_title="$(grep '"custom-title"' "$jsonl" 2>/dev/null | tail -1 | jq -r '.customTitle // empty' 2>/dev/null)"
+custom_title=""
+if [ -f "$jsonl" ]; then
+  custom_title="$(grep '"custom-title"' "$jsonl" 2>/dev/null | tail -1 | jq -r '.customTitle // empty' 2>/dev/null)"
+fi
 
 # Write title if set, UUID otherwise
 if [ -n "$custom_title" ]; then

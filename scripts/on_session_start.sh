@@ -40,7 +40,7 @@ agent_type="$(echo "$input" | jq -r '.agent_type // empty' 2>/dev/null)"
 session_id="$(echo "$input" | jq -r '.session_id // empty' 2>/dev/null)"
 [ -n "$session_id" ] || exit 0
 
-pane_key="$(tmux display-message -p '#S-#I-#P' 2>/dev/null)"
+pane_key="$(tmux display-message -t "${TMUX_PANE:-}" -p '#S-#I-#P' 2>/dev/null)"
 [ -n "$pane_key" ] || exit 0
 
 panes_dir="$(tmux show-option -gqv @claude-continuity-panes-dir 2>/dev/null)"
