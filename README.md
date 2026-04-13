@@ -56,9 +56,9 @@ You can recover manually with `claude --resume <uuid>`, but first you have to fi
 
 tmux-claude-continuity does that bookkeeping for you.
 
-Every time Claude Code starts a session (new, resumed, cleared, or compacted), its `SessionStart` hook writes a resume token to a file named after the pane's position: `~/.config/tmux-claude/panes/<session>-<window>-<pane>.session-id`.
+Every time Claude Code starts a session (new, resumed, cleared, or compacted), its `SessionStart` hook writes the session UUID to a file named after the pane's position: `~/.config/tmux-claude/panes/<session>-<window>-<pane>.session-id`.
 
-If you named your session with `/title`, the token is that name. Otherwise it is the session UUID. The `Stop` hook keeps the token updated after every turn, so `/title` changes take effect immediately.
+If you named your session with `/title`, the custom title is stored on line 2 of the sidecar (for display purposes), but the UUID on line 1 is always used for `--resume` — ensuring reliable direct resume rather than fuzzy search. The `Stop` hook keeps both values updated after every turn.
 
 After tmux-resurrect restores, a post-restore hook reads those files and sends `claude --resume <token>` to each pane that was running Claude.
 
@@ -68,17 +68,17 @@ After tmux-resurrect restores, a post-restore hook reads those files and sends `
 Claude Code starts in pane  work:1.0
   └── SessionStart hook fires
       └── writes  ~/.config/tmux-claude/panes/work-1-0.session-id
-                  (contains session UUID, or custom title if /title was used)
+                  (line 1: session UUID, line 2: custom title if set)
 
 User types /title bugfix-sentry
   └── Stop hook fires after the turn
-      └── updates  work-1-0.session-id  →  "bugfix-sentry"
+      └── updates  work-1-0.session-id  →  line 1: UUID, line 2: "bugfix-sentry"
 
 You restore tmux with tmux-resurrect
   └── post_restore.sh fires after all panes are recreated
       ├── reads the resurrect save file
       ├── finds panes that were running claude
-      └── sends  claude --resume bugfix-sentry  (or --resume <uuid>)  to each one
+      └── sends  claude --resume <uuid>  to each one
 ```
 
 ### Why pane identity survives restore

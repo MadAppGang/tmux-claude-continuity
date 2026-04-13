@@ -62,7 +62,10 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
     continue
   fi
 
-  resume_token="$(cat "$metadata_file")"
+  # Line 1 is always the UUID; line 2 (if present) is the display title.
+  # Old single-line sidecars may contain a title instead of UUID — still usable
+  # as a --resume search term, but less reliable.
+  resume_token="$(head -1 "$metadata_file")"
 
   if [ -n "$resume_token" ]; then
     $TMUX_CMD send-keys -t "${session}:${win}.${pane_idx}" \

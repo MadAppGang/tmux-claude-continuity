@@ -59,9 +59,10 @@ if [ -n "$cwd" ]; then
   fi
 fi
 
-# Write title if set, UUID otherwise
+# Line 1: always the UUID (used by post_restore.sh for --resume)
+# Line 2: custom title if set (used for display/diagnostics only)
 if [ -n "$custom_title" ]; then
-  echo "$custom_title" > "${panes_dir}/${pane_key}.session-id"
+  printf '%s\n%s\n' "$session_id" "$custom_title" > "${panes_dir}/${pane_key}.session-id"
 else
   echo "$session_id" > "${panes_dir}/${pane_key}.session-id"
 fi

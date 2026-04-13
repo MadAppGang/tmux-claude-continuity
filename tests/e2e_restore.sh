@@ -203,6 +203,41 @@ sleep 0.5
 pane_alias="$(_capture work:1.1)"
 assert_contains "custom alias with --resume" "$pane_alias" "myalias --resume session-ddd"
 
+# ── Test 7: Two-line sidecar (UUID + title) uses UUID ────────────────────────
+
+echo "Test 7: Two-line sidecar uses UUID from line 1, not title from line 2"
+
+_fresh_server 1
+tmux -L "$SOCKET" set-option -g @claude-continuity-claude-cmd "$TEST_CMD"
+
+printf '%s\n%s\n' "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" "my-custom-title" \
+  > "$PANES_DIR/work-1-1.session-id"
+
+printf 'pane\twork\t1\t1\t:*\t1\tClaude Code\t/tmp\t1\tclaude\t:claude\n' > "$RESURRECT_FILE"
+
+_run_restore
+sleep 0.5
+
+pane_titled="$(_capture work:1.1)"
+assert_contains "uses UUID from line 1" "$pane_titled" "--resume aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+assert_not_contains "does not use title" "$pane_titled" "my-custom-title"
+
+# ── Test 8: Legacy single-line title sidecar still works ─────────────────────
+
+echo "Test 8: Legacy sidecar with title (no UUID) falls back to title as search term"
+
+_fresh_server 1
+
+echo "bugfix-sentry" > "$PANES_DIR/work-1-1.session-id"
+
+printf 'pane\twork\t1\t1\t:*\t1\tClaude Code\t/tmp\t1\tclaude\t:claude\n' > "$RESURRECT_FILE"
+
+_run_restore
+sleep 0.5
+
+pane_legacy="$(_capture work:1.1)"
+assert_contains "legacy title used as search term" "$pane_legacy" "--resume bugfix-sentry"
+
 # ── Results ──────────────────────────────────────────────────────────────────
 
 echo ""

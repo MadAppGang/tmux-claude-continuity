@@ -289,20 +289,24 @@ section "6. Sidecar files"
 sidecar_count=0
 sidecar_empty=0
 sidecar_uuid=0
-sidecar_title=0
+sidecar_titled=0
+sidecar_legacy_title=0
 uuid_pattern='^[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}$'
 
 if [ -d "$panes_dir" ]; then
   for f in "${panes_dir}"/*.session-id; do
     [ -f "$f" ] || continue
     ((sidecar_count++))
-    content="$(cat "$f")"
-    if [ -z "$content" ]; then
+    # Line 1 is always the resume token (UUID or legacy title)
+    line1="$(head -1 "$f")"
+    line2="$(sed -n '2p' "$f")"
+    if [ -z "$line1" ]; then
       ((sidecar_empty++))
-    elif echo "$content" | grep -q "$uuid_pattern"; then
+    elif echo "$line1" | grep -q "$uuid_pattern"; then
       ((sidecar_uuid++))
+      [ -n "$line2" ] && ((sidecar_titled++))
     else
-      ((sidecar_title++))
+      ((sidecar_legacy_title++))
     fi
   done
 fi
@@ -311,9 +315,13 @@ if [ "$sidecar_count" -eq 0 ]; then
   warn "no sidecar files found"
   info "They appear after Claude Code sessions start in tmux panes"
 else
-  ok "$sidecar_count sidecar files ($sidecar_uuid UUIDs, $sidecar_title titles)"
+  ok "$sidecar_count sidecar files ($sidecar_uuid UUIDs, $sidecar_titled with titles)"
   if [ "$sidecar_empty" -gt 0 ]; then
     warn "$sidecar_empty empty sidecar files (will fall back to fresh sessions)"
+  fi
+  if [ "$sidecar_legacy_title" -gt 0 ]; then
+    warn "$sidecar_legacy_title legacy sidecar files with title instead of UUID (will use title as search term)"
+    info "These will auto-fix when Claude Code starts in those panes"
   fi
 fi
 
