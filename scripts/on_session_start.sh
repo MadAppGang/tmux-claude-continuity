@@ -66,3 +66,20 @@ if [ -n "$custom_title" ]; then
 else
   echo "$session_id" > "${panes_dir}/${pane_key}.session-id"
 fi
+
+# ── PID-keyed sidecar ─────────────────────────────────────────────────────────
+# The position-keyed file above (session-window-pane index) drifts when tmux
+# windows are renumbered, moved, or swapped between save and restore. The
+# PID-keyed file is unambiguous for the lifetime of the Claude process and is
+# the primary source for the post-save snapshot enrichment hook (pre_save.sh).
+#
+# $PPID is the Claude process that invoked this hook. PID-keyed files become
+# orphans when Claude exits; pre_save.sh garbage collects them on each save.
+by_pid_dir="${panes_dir}/by-pid"
+mkdir -p "$by_pid_dir"
+
+if [ -n "$custom_title" ]; then
+  printf '%s\n%s\n' "$session_id" "$custom_title" > "${by_pid_dir}/${PPID}.session-id"
+else
+  echo "$session_id" > "${by_pid_dir}/${PPID}.session-id"
+fi

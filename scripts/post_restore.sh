@@ -45,7 +45,7 @@ done
 
 # Resume claude in panes that were running it
 while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
-        pane_title dir pane_active pane_cmd pane_full_cmd; do
+        pane_title dir pane_active pane_cmd pane_full_cmd extra1 extra2; do
   [ "$line_type" = "pane" ] || continue
 
   # Strip leading ":" sentinel from full command field
@@ -54,18 +54,25 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   # Only act on panes that were running claude (or custom alias)
   [[ "$full_cmd" == *"claude"* ]] || [[ "$full_cmd" == *"$claude_cmd"* ]] || continue
 
-  pane_key="${session}-${win}-${pane_idx}"
-  metadata_file="${panes_dir}/${pane_key}.session-id"
+  # Prefer the snapshot-embedded session ID (written by pre_save.sh at save
+  # time, when PID and session ID were both observable and unambiguous).
+  # Format: ";CLAUDE_SID=<uuid>" appearing as a trailing tab-separated field.
+  resume_token=""
+  for field in "$extra1" "$extra2"; do
+    case "$field" in
+      ";CLAUDE_SID="*) resume_token="${field#;CLAUDE_SID=}"; break ;;
+    esac
+  done
 
-  if [ ! -f "$metadata_file" ]; then
-    $TMUX_CMD send-keys -t "${session}:${win}.${pane_idx}" "$claude_cmd" "Enter"
-    continue
+  # Fall back to position-keyed sidecar if snapshot wasn't enriched (older
+  # snapshots from before pre_save.sh existed, or panes whose hook never fired).
+  if [ -z "$resume_token" ]; then
+    pane_key="${session}-${win}-${pane_idx}"
+    metadata_file="${panes_dir}/${pane_key}.session-id"
+    if [ -f "$metadata_file" ]; then
+      resume_token="$(head -1 "$metadata_file")"
+    fi
   fi
-
-  # Line 1 is always the UUID; line 2 (if present) is the display title.
-  # Old single-line sidecars may contain a title instead of UUID — still usable
-  # as a --resume search term, but less reliable.
-  resume_token="$(head -1 "$metadata_file")"
 
   if [ -n "$resume_token" ]; then
     $TMUX_CMD send-keys -t "${session}:${win}.${pane_idx}" \
