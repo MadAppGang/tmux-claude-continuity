@@ -22,6 +22,39 @@ set -u
 SNAPSHOT_FILE="${1:-}"
 [ -n "$SNAPSHOT_FILE" ] && [ -f "$SNAPSHOT_FILE" ] || exit 0
 
+# ── Repair collapsed pane lines (empty pane_title) ───────────────────────────
+# tmux-resurrect's save format writes each pane as tab-separated columns:
+#   1:pane 2:session 3:window 4:win_active 5::win_flags 6:pane_index
+#   7:pane_title 8::pane_current_path 9:pane_active 10:cmd 11::full_command…
+# (cols beyond 10 vary with process-restore mode; we only touch the 7/8 boundary)
+# Columns 5, 8, and the full-command field carry a leading ':' sentinel so an
+# empty value still occupies its slot. pane_title (col 7) has NO such sentinel.
+# When a pane's title is empty (every non-Claude pane: zsh, bun, MCP procs), the
+# field collapses, every later column shifts left by one, and restore.sh reads
+# the pane_active flag ('0'/'1') as the directory. `split-window -c 1` then fails
+# and tmux silently falls back to $HOME — restoring that pane in the wrong dir.
+#
+# Detection is exact: col 8 is ALWAYS ':'-prefixed in a healthy line (the path
+# sentinel is hardcoded in save.sh). If col 8 does not start with ':', the row
+# shifted and the ':'-prefixed path is sitting in col 7. We re-insert an empty
+# title field at col 7 to realign. Idempotent: a repaired line has a ':' in col 8
+# again, so a second pass skips it. Runs before the SID-enrichment early-exit so
+# the directory fix applies on every save, even with no Claude panes present.
+realigned="${SNAPSHOT_FILE}.realign.$$"
+if awk -F'\t' 'BEGIN { OFS = "\t" }
+  $1 == "pane" && $8 !~ /^:/ {
+    # Title was empty -> path leaked into col 7. Shift cols 7..NF right by one
+    # and clear col 7 so pane_current_path lands back in col 8.
+    for (i = NF; i >= 7; i--) $(i + 1) = $i
+    $7 = ""
+  }
+  { print }
+' "$SNAPSHOT_FILE" > "$realigned" && [ -s "$realigned" ]; then
+  mv "$realigned" "$SNAPSHOT_FILE"
+else
+  rm -f "$realigned"
+fi
+
 panes_dir="$(tmux show-option -gqv @claude-continuity-panes-dir 2>/dev/null)"
 panes_dir="${panes_dir:-$HOME/.config/tmux-claude/panes}"
 by_pid_dir="${panes_dir}/by-pid"
