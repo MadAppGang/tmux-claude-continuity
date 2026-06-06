@@ -6,12 +6,20 @@
 # then resumes them via @resurrect-hook-post-restore-all after restore.
 #
 # Options (set in ~/.tmux.conf):
-#   @claude-continuity-panes-dir     Where to store per-pane session ID files
+#   @claude-continuity-panes-dir     Where to store per-pane session ID sidecars
 #                                    Default: ~/.config/tmux-claude/panes
-#   @claude-continuity-restore-delay Seconds to wait before sending keys on restore
-#                                    Default: 1
-#   @claude-continuity-claude-flags  Extra flags appended to restored claude command
-#                                    Default: --dangerously-skip-permissions
+#   @claude-continuity-pending-dir   Where post_restore queues pending resumes for
+#                                    the claude-continuity.zsh precmd hook to read
+#                                    Default: ~/.config/tmux-claude/pending
+#   @claude-continuity-claude-cmd    Command used to (re)launch claude. A bare
+#                                    alias like "c" is expanded to its binary form
+#                                    at restore time. Default: claude
+#
+# Resume is driven by a zsh precmd hook (claude-continuity.zsh), NOT by timed
+# send-keys. Source it from ~/.zshrc:
+#   source ~/.tmux/plugins/tmux-claude-continuity/claude-continuity.zsh
+# The old @claude-continuity-restore-delay option is obsolete (the precmd fires
+# on the shell's first real prompt, so there is no delay to tune).
 
 CURRENT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 

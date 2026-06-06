@@ -22,6 +22,46 @@ set -u
 SNAPSHOT_FILE="${1:-}"
 [ -n "$SNAPSHOT_FILE" ] && [ -f "$SNAPSHOT_FILE" ] || exit 0
 
+# ── Clobber guard (runs at script exit, after enrichment) ────────────────────
+# save.sh writes this snapshot to a NEW timestamped file and calls us BEFORE it
+# repoints `last`. If the *current* `last` records many Claude sessions but the
+# *final, enriched* new snapshot records ZERO, this save is almost certainly
+# capturing a failed restore (all panes fell back to bare shells), not a real
+# teardown. Letting it through repoints `last` at a tokenless snapshot and
+# destroys resume continuity — the data-loss that turns a cosmetic restore
+# glitch into a near-catastrophe.
+#
+# MUST run after the CLAUDE_SID enrichment below (a raw resurrect dump has zero
+# sentinels — this script ADDS them — so an early check would block every save).
+# We register it as an EXIT trap so it fires on every code path, including the
+# early `exit 0` when no by-pid dir exists.
+#
+# Defuse a wipe by overwriting the new file with the current `last` contents.
+# save.sh then sees them as identical (files_differ == false), deletes the new
+# file, and leaves `last` pointing at the good snapshot. Triggers only on an
+# exact-zero wipe, so legitimate pane closures (never exactly zero while others
+# remain) pass through untouched.
+clobber_guard() {
+  local guard_log="$HOME/.tmux/scripts/claude-continuity-clobber-guard.log"
+  local last_guard; last_guard="$(dirname "$SNAPSHOT_FILE")/last"
+  [ -e "$last_guard" ] || return 0
+  # Don't guard against ourselves: if save.sh hasn't repointed yet, `last` is the
+  # PREVIOUS snapshot, never this one. (resolve to compare paths defensively)
+  case "$(readlink "$last_guard" 2>/dev/null)" in
+    "$(basename "$SNAPSHOT_FILE")") return 0 ;;
+  esac
+  local prev new
+  prev="$(grep -c 'CLAUDE_SID' "$last_guard" 2>/dev/null)"; prev="${prev:-0}"
+  new="$(grep -c 'CLAUDE_SID' "$SNAPSHOT_FILE" 2>/dev/null)"; new="${new:-0}"
+  if [ "$prev" -ge 3 ] && [ "$new" -eq 0 ]; then
+    mkdir -p "$(dirname "$guard_log")"
+    printf '[%s] BLOCKED near-total-wipe save: last had %s CLAUDE_SID, new had 0 — keeping good snapshot\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "$prev" >> "$guard_log"
+    cat "$last_guard" > "$SNAPSHOT_FILE" 2>/dev/null || true
+  fi
+}
+trap clobber_guard EXIT
+
 # ── Repair collapsed pane lines (empty pane_title) ───────────────────────────
 # tmux-resurrect's save format writes each pane as tab-separated columns:
 #   1:pane 2:session 3:window 4:win_active 5::win_flags 6:pane_index
@@ -78,7 +118,8 @@ done
 # Whichever child has a registered session ID is the Claude process for that
 # pane. Output: one line per pane with format "<S>:<W>.<P> <session_id>".
 declare_map_file="${SNAPSHOT_FILE}.sidmap.$$"
-trap 'rm -f "$declare_map_file" "${SNAPSHOT_FILE}.enrich.$$"' EXIT
+# Keep the clobber_guard on EXIT and add temp-file cleanup ahead of it.
+trap 'rm -f "$declare_map_file" "${SNAPSHOT_FILE}.enrich.$$"; clobber_guard' EXIT
 
 tmux list-panes -a -F '#S	#I	#P	#{pane_pid}' 2>/dev/null | \
 while IFS=$'\t' read -r sess win pane shell_pid; do
@@ -121,4 +162,7 @@ done < "$SNAPSHOT_FILE" > "$tmp"
 
 mv "$tmp" "$SNAPSHOT_FILE"
 rm -f "$declare_map_file"
+# Drop the temp-cleanup+guard trap (temps already cleaned) and run the guard
+# once, explicitly, against the now-enriched snapshot.
 trap - EXIT
+clobber_guard
