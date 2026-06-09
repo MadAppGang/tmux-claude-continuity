@@ -17,6 +17,21 @@
 
 TMUX_CMD="${TMUX_CMD:-tmux}"
 
+# ── Logging ──────────────────────────────────────────────────────────────────
+# Zero observability was the single biggest gap: when a boot restore silently
+# fails to relaunch claude, the ONLY way to tell "post_restore never ran" from
+# "ran but resolved no panes" was hours of forensic archaeology (empty pending
+# dir, JSONL mtimes, snapshot diffing). One log line per run + per pane converts
+# that into a single `tail`. The very first line proves the hook fired at all.
+LOG_FILE="$($TMUX_CMD show-option -gqv @claude-continuity-log-file 2>/dev/null)"
+LOG_FILE="${LOG_FILE:-$HOME/.tmux/scripts/claude-continuity-restore.log}"
+_cc_log() {
+  # Best-effort: never let logging failure abort a restore.
+  { mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null && \
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"; } 2>/dev/null || true
+}
+_cc_log "post_restore START (pid=$$ tmux='${TMUX_CMD}')"
+
 # Resolve the snapshot path the SAME way tmux-resurrect does, so we always read
 # the file that was actually restored. An explicit RESURRECT_FILE env wins (used
 # by tests); otherwise honor @resurrect-dir (resurrect's own option), expanding
@@ -88,7 +103,11 @@ resolve_claude_cmd() {
   printf '%s' "$claude_cmd"
 }
 
-[ -f "$RESURRECT_FILE" ] || exit 0
+if [ ! -f "$RESURRECT_FILE" ]; then
+  _cc_log "EXIT: resurrect file not found: $RESURRECT_FILE"
+  exit 0
+fi
+_cc_log "reading snapshot: $RESURRECT_FILE ($(grep -c '^pane' "$RESURRECT_FILE" 2>/dev/null) pane lines)"
 
 mkdir -p "$pending_dir"
 
@@ -110,6 +129,44 @@ for sidecar in "${panes_dir}"/*.session-id; do
 done
 
 base_cmd="$(resolve_claude_cmd)"
+_cc_written=0
+
+# ── Live pane index for content-based resolution ─────────────────────────────
+# The snapshot records each pane's position as session:window.pane, but tmux
+# `renumber-windows` (and window move/swap) changes those indices between save
+# and restore. Worse, `display-message -t S:W.P` does NOT fail on a missing
+# window — tmux resolves the target *fuzzily* to a nearby window, so a stale
+# coordinate silently resolves to the WRONG live pane and the resume is
+# misrouted into another session's pane.
+#
+# To be drift-proof we resolve by stable CONTENT instead: match the snapshot
+# row's (session, cwd, title) against the live layout. Duplicate titles within a
+# session (e.g. several "Claude Code" panes) are disambiguated positionally —
+# each live pane is consumed at most once, in snapshot order. Coordinates are
+# kept only as a last-resort fallback when no content match exists.
+#
+# We snapshot the live layout ONCE into a newline-delimited table:
+#   <session>\t<cwd>\t<title>\t<pane_id>
+_cc_live_panes="$($TMUX_CMD list-panes -a -F '#{session_name}	#{pane_current_path}	#{pane_title}	#{pane_id}' 2>/dev/null)"
+_cc_used_ids="|"   # pane ids already claimed this run, wrapped in | for substring test
+
+# Resolve a snapshot row to a live pane id by content, consuming it. Echoes the
+# pane id (e.g. %7) on success, nothing on no match. Args: session cwd title.
+_cc_resolve_by_content() {
+  local s="$1" c="$2" t="$3"
+  local lp_sess lp_cwd lp_title lp_id
+  while IFS=$'\t' read -r lp_sess lp_cwd lp_title lp_id; do
+    [ -n "$lp_id" ] || continue
+    [ "$lp_sess" = "$s" ] && [ "$lp_cwd" = "$c" ] && [ "$lp_title" = "$t" ] || continue
+    case "$_cc_used_ids" in *"|${lp_id}|"*) continue ;; esac  # already claimed
+    _cc_used_ids="${_cc_used_ids}${lp_id}|"
+    printf '%s' "$lp_id"
+    return 0
+  done <<EOF
+$_cc_live_panes
+EOF
+  return 1
+}
 
 # Queue a pending resume for each pane that was running claude.
 while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
@@ -120,7 +177,9 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   full_cmd="${pane_full_cmd#:}"
 
   # Only act on panes that were running claude (or custom alias)
-  [[ "$full_cmd" == *"claude"* ]] || [[ "$full_cmd" == *"$claude_cmd"* ]] || continue
+  if [[ "$full_cmd" != *"claude"* ]] && [[ "$full_cmd" != *"$claude_cmd"* ]]; then
+    continue
+  fi
 
   # Prefer the snapshot-embedded session ID (written by pre_save.sh at save
   # time). Format: ";CLAUDE_SID=<uuid>" appearing as a trailing field.
@@ -140,23 +199,51 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
     fi
   fi
 
-  # Resolve the live tmux pane id (%N) for this snapshot position. The precmd
-  # hook keys off $TMUX_PANE, so we must write the pending file under the pane
-  # id, not the session:window.pane string.
+  # Resolve the live tmux pane id (%N) for this snapshot row. The precmd hook
+  # keys off $TMUX_PANE, so we write the pending file under the pane id, not the
+  # session:window.pane string.
+  #
+  # PRIMARY: match by content (session, cwd, title) — immune to window renumber/
+  # move/swap. The snapshot's dir field carries a leading ':' sentinel; strip it
+  # to match #{pane_current_path}.
   pane_target="${session}:${win}.${pane_idx}"
-  pane_id="$($TMUX_CMD display-message -t "$pane_target" -p '#{pane_id}' 2>/dev/null)"
+  snap_dir="${dir#:}"
+  pane_id="$(_cc_resolve_by_content "$session" "$snap_dir" "$pane_title")"
+  match_kind="content"
+
+  # FALLBACK: only if no content match (e.g. cwd/title changed since save), fall
+  # back to the coordinate lookup. NOTE: tmux resolves S:W.P fuzzily, so this can
+  # misroute — but it is strictly better than dropping the resume, and the log
+  # records that a fallback (not a content match) was used.
   if [ -z "$pane_id" ]; then
-    # Pane no longer exists in the live layout (e.g. a session was killed
-    # between save and restore). Nothing to relaunch into; skip quietly.
+    cand="$($TMUX_CMD display-message -t "$pane_target" -p '#{pane_id}' 2>/dev/null)"
+    # Don't reuse a pane id another row already claimed by content.
+    case "$_cc_used_ids" in
+      *"|${cand}|"*) cand="" ;;
+    esac
+    if [ -n "$cand" ]; then
+      pane_id="$cand"
+      _cc_used_ids="${_cc_used_ids}${cand}|"
+      match_kind="coord-fallback"
+    fi
+  fi
+
+  if [ -z "$pane_id" ]; then
+    # No live pane could be resolved by content or coordinate. Skip rather than
+    # misroute the resume into an unrelated pane.
+    _cc_log "SKIP $pane_target ('$pane_title' @ $snap_dir): no live pane resolved (token=${resume_token:-none})"
     continue
   fi
   pane_key_file="${pending_dir}/${pane_id#%}"
 
   if [ -n "$resume_token" ]; then
     printf '%s --resume %s\n' "$base_cmd" "$resume_token" > "$pane_key_file"
+    _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') resume=$resume_token"
   else
     printf '%s\n' "$base_cmd" > "$pane_key_file"
+    _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') bare (no token)"
   fi
+  _cc_written=$((_cc_written + 1))
 
   # Nudge the pane so the armed precmd hook fires now. Two orderings to cover:
   #   - shell still sourcing .zshrc: the file is already written, so its first
@@ -170,3 +257,5 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   $TMUX_CMD send-keys -t "$pane_id" "" Enter 2>/dev/null
 
 done < "$RESURRECT_FILE"
+
+_cc_log "post_restore DONE: wrote $_cc_written pending resume file(s)"
