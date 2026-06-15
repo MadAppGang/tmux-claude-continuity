@@ -114,9 +114,19 @@ for f in "${by_pid_dir}"/*.session-id; do
 done
 
 # ── Build pane → session_id mapping from live tmux state ─────────────────────
-# For each tmux pane, look at its child PIDs and check the by-pid sidecar dir.
-# Whichever child has a registered session ID is the Claude process for that
-# pane. Output: one line per pane with format "<S>:<W>.<P> <session_id>".
+# For each tmux pane, find the Claude process and look it up in the by-pid
+# sidecar dir. Output: one line per pane with format "<S>:<W>.<P> <session_id>".
+#
+# The Claude process can be the pane process in TWO shapes, and we MUST check
+# both or enrichment silently misses sessions:
+#   1. pane_pid ITSELF — the resume path runs `exec claude ...`, so Claude
+#      replaces the pane's shell and inherits its PID. This is the common case
+#      (a resumed session). on_session_start.sh registered by-pid/<pane_pid>.
+#   2. a CHILD of pane_pid — Claude launched as a child of an interactive shell
+#      that did NOT exec (e.g. typed `claude` at a normal prompt).
+# Checking pane_pid first, then children, covers both. (The original code only
+# checked children, so every exec'd/resumed session — the majority — was missed,
+# and the snapshot saved almost no CLAUDE_SIDs, breaking the next restore.)
 declare_map_file="${SNAPSHOT_FILE}.sidmap.$$"
 # Keep the clobber_guard on EXIT and add temp-file cleanup ahead of it.
 trap 'rm -f "$declare_map_file" "${SNAPSHOT_FILE}.enrich.$$"; clobber_guard' EXIT
@@ -124,13 +134,33 @@ trap 'rm -f "$declare_map_file" "${SNAPSHOT_FILE}.enrich.$$"; clobber_guard' EXI
 tmux list-panes -a -F '#S	#I	#P	#{pane_pid}' 2>/dev/null | \
 while IFS=$'\t' read -r sess win pane shell_pid; do
   [ -n "$shell_pid" ] || continue
-  for child in $(pgrep -P "$shell_pid" 2>/dev/null); do
-    if [ -f "${by_pid_dir}/${child}.session-id" ]; then
-      sid="$(head -1 "${by_pid_dir}/${child}.session-id")"
-      [ -n "$sid" ] && printf '%s:%s.%s\t%s\n' "$sess" "$win" "$pane" "$sid"
-      break
+  # Candidate PIDs: the pane process itself first (exec'd/resumed Claude), then
+  # its direct children (Claude launched as a child of a non-exec shell).
+  cands="$shell_pid $(pgrep -P "$shell_pid" 2>/dev/null)"
+
+  # SOURCE 1 (registry): the by-pid sidecar written by on_session_start.sh.
+  # Authoritative when the SessionStart hook fired — also covers FRESH sessions
+  # (a plain `claude` with no --resume flag), which have no SID on the cmdline.
+  sid=""
+  for cand in $cands; do
+    if [ -f "${by_pid_dir}/${cand}.session-id" ]; then
+      sid="$(head -1 "${by_pid_dir}/${cand}.session-id")"
+      [ -n "$sid" ] && break
     fi
   done
+
+  # SOURCE 2 (cmdline fallback): scrape `--resume <uuid>` from the process args.
+  # Catches RESUMED sessions whose SessionStart hook never registered a sidecar
+  # (hook timing / send-keys relaunch). Independent of the hook firing at all.
+  if [ -z "$sid" ]; then
+    for cand in $cands; do
+      sid="$(ps -o command= -p "$cand" 2>/dev/null \
+        | grep -oE 'resume [0-9a-fA-F-]{36}' | awk '{print $2; exit}')"
+      [ -n "$sid" ] && break
+    done
+  fi
+
+  [ -n "$sid" ] && printf '%s:%s.%s\t%s\n' "$sess" "$win" "$pane" "$sid"
 done > "$declare_map_file"
 
 # ── Enrich the snapshot ──────────────────────────────────────────────────────
