@@ -95,13 +95,14 @@ printf 'pane\twork\t%s\t1\t:*\t1\tDebug skills\t:%s\t1\tclaude\t:claude --danger
 TMUX_CMD="tmux -L $SOCKET" RESURRECT_FILE="$RF" bash "$RESTORE_SCRIPT"
 
 # ── Assert: the resume landed on the TARGET pane, by content, not misrouted ──
-expected_file="$QD/${target_id#%}"
-if [ -f "$expected_file" ] && grep -q "resume sid-DRIFT" "$expected_file"; then
-  echo "  PASS: resume written to correct pane $target_id (content-matched)"
+# Assert against the LOG, not a surviving pending file: with claude-cmd=echo the
+# post-write `send-keys Enter` makes the echo-pane exit, which can race-remove
+# the file. The WROTE log line records exactly which pane the SID was routed to.
+if grep -q "WROTE .* -> ${target_id} .*resume=sid-DRIFT" "$LOG" 2>/dev/null; then
+  echo "  PASS: resume routed to correct pane $target_id (content-matched)"
   ((pass++))
 else
-  echo "  FAIL: resume not on target pane $target_id"
-  echo "    pending files written:"; ls -1 "$QD" 2>/dev/null | sed 's/^/      %/'
+  echo "  FAIL: resume not routed to target pane $target_id"
   echo "    log:"; grep -E 'WROTE|SKIP' "$LOG" 2>/dev/null | sed 's/^/      /'
   ((fail++))
 fi

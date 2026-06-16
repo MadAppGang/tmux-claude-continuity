@@ -130,6 +130,8 @@ done
 
 base_cmd="$(resolve_claude_cmd)"
 _cc_written=0
+_cc_skipped_absent=0    # SID rows whose session no longer exists live (benign)
+_cc_skipped_present=0   # SID rows whose session IS live but didn't resolve (real miss)
 
 # ── Live pane index for content-based resolution ─────────────────────────────
 # The snapshot records each pane's position as session:window.pane, but tmux
@@ -150,17 +152,27 @@ _cc_written=0
 _cc_live_panes="$($TMUX_CMD list-panes -a -F '#{session_name}	#{pane_current_path}	#{pane_title}	#{pane_id}' 2>/dev/null)"
 _cc_used_ids="|"   # pane ids already claimed this run, wrapped in | for substring test
 
-# Resolve a snapshot row to a live pane id by content, consuming it. Echoes the
-# pane id (e.g. %7) on success, nothing on no match. Args: session cwd title.
+# Resolve a snapshot row to a live pane id by content, consuming it. Result is
+# placed in the global _CC_RESOLVED (empty = no match). Args: session cwd title.
+#
+# CRITICAL: this must run in the CURRENT shell, never a subshell. It mutates the
+# shared _cc_used_ids to mark a live pane as claimed so a later duplicate-title
+# row can't reuse it. If called via command substitution `x="$(...)"`, that runs
+# in a subshell and the _cc_used_ids mutation is DISCARDED — so every duplicate
+# (session,cwd,title) row would resolve to the SAME first pane and overwrite each
+# other (proven: janus:1.1 + janus:2.1 both -> %11). So the caller assigns from
+# the global _CC_RESOLVED, NOT from command substitution. The pane list is read
+# from a here-string (no pipe/subshell) for the same reason.
 _cc_resolve_by_content() {
   local s="$1" c="$2" t="$3"
   local lp_sess lp_cwd lp_title lp_id
+  _CC_RESOLVED=""
   while IFS=$'\t' read -r lp_sess lp_cwd lp_title lp_id; do
     [ -n "$lp_id" ] || continue
     [ "$lp_sess" = "$s" ] && [ "$lp_cwd" = "$c" ] && [ "$lp_title" = "$t" ] || continue
     case "$_cc_used_ids" in *"|${lp_id}|"*) continue ;; esac  # already claimed
     _cc_used_ids="${_cc_used_ids}${lp_id}|"
-    printf '%s' "$lp_id"
+    _CC_RESOLVED="$lp_id"
     return 0
   done <<EOF
 $_cc_live_panes
@@ -176,13 +188,9 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   # Strip leading ":" sentinel from full command field
   full_cmd="${pane_full_cmd#:}"
 
-  # Only act on panes that were running claude (or custom alias)
-  if [[ "$full_cmd" != *"claude"* ]] && [[ "$full_cmd" != *"$claude_cmd"* ]]; then
-    continue
-  fi
-
-  # Prefer the snapshot-embedded session ID (written by pre_save.sh at save
-  # time). Format: ";CLAUDE_SID=<uuid>" appearing as a trailing field.
+  # Extract the snapshot-embedded session ID FIRST (written by pre_save.sh at
+  # save time). Format: ";CLAUDE_SID=<uuid>" as a trailing field. Its presence
+  # is the AUTHORITATIVE marker that this pane is a Claude session.
   resume_token=""
   for field in "$extra1" "$extra2"; do
     case "$field" in
@@ -190,13 +198,22 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
     esac
   done
 
-  # Fall back to position-keyed sidecar if snapshot wasn't enriched.
-  if [ -z "$resume_token" ]; then
-    pane_key="${session}-${win}-${pane_idx}"
-    metadata_file="${panes_dir}/${pane_key}.session-id"
-    if [ -f "$metadata_file" ]; then
-      resume_token="$(head -1 "$metadata_file")"
-    fi
+  # NOTE: we deliberately do NOT fall back to the position-keyed sidecar
+  # (panes_dir/<S>-<W>-<P>.session-id) here. Those drift: when a pane's position
+  # is later reused by a plain shell, the stale sidecar would resume a DEAD
+  # session's SID into a non-Claude pane (proven: circle:1.3 'mac-m5' shell got
+  # a stale 77f75d34 token this way, inflating the count to 34/32). The snapshot
+  # CLAUDE_SID is the only save-time-verified marker, so it is authoritative.
+
+  # Qualify the row as a Claude pane. The snapshot CLAUDE_SID is authoritative.
+  # Only fall through to the full_cmd "claude" check for legacy un-enriched
+  # snapshots (no SID on any row). full_cmd ALONE is insufficient: resurrect's
+  # ps-based capture often records a Claude pane's MCP-server child (tmux-mcp,
+  # railway mcp, mnemex --mcp, mcp-server.py) instead of claude — which silently
+  # dropped 20 of 32 enriched sessions (proven: boot verdict 12/32).
+  if [ -z "$resume_token" ] \
+     && [[ "$full_cmd" != *"claude"* ]] && [[ "$full_cmd" != *"$claude_cmd"* ]]; then
+    continue
   fi
 
   # Resolve the live tmux pane id (%N) for this snapshot row. The precmd hook
@@ -208,7 +225,10 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   # to match #{pane_current_path}.
   pane_target="${session}:${win}.${pane_idx}"
   snap_dir="${dir#:}"
-  pane_id="$(_cc_resolve_by_content "$session" "$snap_dir" "$pane_title")"
+  # Call in the CURRENT shell (no command substitution) so _cc_used_ids mutation
+  # persists; read the result from the global it sets.
+  _cc_resolve_by_content "$session" "$snap_dir" "$pane_title"
+  pane_id="$_CC_RESOLVED"
   match_kind="content"
 
   # FALLBACK: only if no content match (e.g. cwd/title changed since save), fall
@@ -230,8 +250,17 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
 
   if [ -z "$pane_id" ]; then
     # No live pane could be resolved by content or coordinate. Skip rather than
-    # misroute the resume into an unrelated pane.
-    _cc_log "SKIP $pane_target ('$pane_title' @ $snap_dir): no live pane resolved (token=${resume_token:-none})"
+    # misroute the resume into an unrelated pane. Classify the skip so the boot
+    # verdict can tell a BENIGN miss (the whole session no longer exists in the
+    # live layout — nothing to resume into) from a REAL miss (session is present
+    # but this row didn't resolve, which would mean a lost session).
+    if $TMUX_CMD has-session -t "$session" 2>/dev/null; then
+      _cc_skipped_present=$((_cc_skipped_present + 1))
+      _cc_log "SKIP $pane_target ('$pane_title' @ $snap_dir): session live but no pane resolved (token=${resume_token:-none}) — REAL MISS"
+    else
+      _cc_skipped_absent=$((_cc_skipped_absent + 1))
+      _cc_log "SKIP $pane_target ('$pane_title'): session '$session' not in live layout — nothing to resume into (benign)"
+    fi
     continue
   fi
   pane_key_file="${pending_dir}/${pane_id#%}"
@@ -257,5 +286,31 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   $TMUX_CMD send-keys -t "$pane_id" "" Enter 2>/dev/null
 
 done < "$RESURRECT_FILE"
+
+# ── Boot verdict ─────────────────────────────────────────────────────────────
+# Self-certify the restore so a real reboot reports pass/fail instead of leaving
+# you to discover bare panes by eye.
+#   total      = snapshot pane rows carrying a CLAUDE_SID (sessions promised).
+#   absent     = of those, ones whose SESSION no longer exists live — these can
+#                NEVER be resumed (no pane), so they're benign, not failures.
+#   resumable  = total - absent  (the honest denominator).
+#   written    = pending files we actually wrote (== distinct panes, dedup-safe).
+# PASS iff every resumable session resumed AND there were zero REAL misses
+# (a real miss = session live but row didn't resolve = a lost session).
+_cc_total="$(grep -c 'CLAUDE_SID' "$RESURRECT_FILE" 2>/dev/null)"; _cc_total="${_cc_total:-0}"
+_cc_resumable=$((_cc_total - _cc_skipped_absent))
+
+if [ "$_cc_written" -ge "$_cc_resumable" ] && [ "$_cc_skipped_present" -eq 0 ] && [ "$_cc_total" -gt 0 ]; then
+  _cc_log "BOOT VERDICT: PASS — resumed $_cc_written/$_cc_resumable resumable session(s) (${_cc_skipped_absent} snapshot session(s) absent from live layout, $_cc_total total)"
+  $TMUX_CMD set-option -gu @claude-continuity-boot-warning 2>/dev/null
+else
+  _cc_log "BOOT VERDICT: INCOMPLETE — resumed $_cc_written/$_cc_resumable resumable ($_cc_skipped_present REAL miss, $_cc_skipped_absent absent, $_cc_total total)"
+  $TMUX_CMD set-option -g @claude-continuity-boot-warning \
+    "⚠ claude-continuity: $_cc_written/$_cc_resumable resumed, $_cc_skipped_present lost — see $LOG_FILE" 2>/dev/null
+  { printf '[%s] INCOMPLETE written=%s resumable=%s realmiss=%s absent=%s total=%s snapshot=%s\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "$_cc_written" "$_cc_resumable" "$_cc_skipped_present" \
+      "$_cc_skipped_absent" "$_cc_total" "$RESURRECT_FILE" \
+      >> "${LOG_FILE%.log}-incomplete.log"; } 2>/dev/null || true
+fi
 
 _cc_log "post_restore DONE: wrote $_cc_written pending resume file(s)"
