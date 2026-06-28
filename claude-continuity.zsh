@@ -53,10 +53,19 @@ _claude_continuity_resume() {
 
   [[ -n "$cmd" ]] || return 0
 
-  # exec so claude replaces the shell — quitting claude ends the pane's program
-  # exactly like a normal `claude` invocation would. eval handles the flags/args
-  # embedded in the saved command string.
-  eval "exec ${cmd}"
+  # Run claude as a CHILD of the shell — do NOT exec.
+  #
+  # exec would replace this zsh with claude, so quitting claude would leave the
+  # pane with no program and tmux would close it. That breaks the parity we
+  # actually want: a normal `claude` is typed at an interactive prompt, so
+  # quitting it drops you back to THAT shell. On a restored pane the precmd-
+  # launched claude is the pane's only program, so to preserve the same "quit →
+  # interactive zsh" behavior we must keep the shell alive underneath.
+  #
+  # eval handles the flags/args embedded in the saved command string. After
+  # claude exits we return to the normal interactive prompt; the hook has already
+  # disarmed itself above, so there is no relaunch loop.
+  eval "${cmd}"
 }
 
 autoload -Uz add-zsh-hook

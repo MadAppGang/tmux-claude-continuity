@@ -119,14 +119,18 @@ done
 #
 # The Claude process can be the pane process in TWO shapes, and we MUST check
 # both or enrichment silently misses sessions:
-#   1. pane_pid ITSELF — the resume path runs `exec claude ...`, so Claude
-#      replaces the pane's shell and inherits its PID. This is the common case
-#      (a resumed session). on_session_start.sh registered by-pid/<pane_pid>.
+#   1. pane_pid ITSELF — Claude is the pane's process directly. Happens when the
+#      pane was started with `exec claude` (some launchers / older resume path),
+#      so Claude replaced the shell and inherited its PID.
 #   2. a CHILD of pane_pid — Claude launched as a child of an interactive shell
-#      that did NOT exec (e.g. typed `claude` at a normal prompt).
+#      that did NOT exec. This is the common case: typing `claude` at a normal
+#      prompt, AND the first-prompt resume path (which deliberately runs claude
+#      as a child so quitting it returns to interactive zsh — see
+#      claude-continuity.zsh).
 # Checking pane_pid first, then children, covers both. (The original code only
-# checked children, so every exec'd/resumed session — the majority — was missed,
-# and the snapshot saved almost no CLAUDE_SIDs, breaking the next restore.)
+# checked children — fine for child-launched Claude, but it missed any exec'd
+# pane-process Claude, so those snapshots saved no CLAUDE_SID and broke the next
+# restore.)
 declare_map_file="${SNAPSHOT_FILE}.sidmap.$$"
 # Keep the clobber_guard on EXIT and add temp-file cleanup ahead of it.
 trap 'rm -f "$declare_map_file" "${SNAPSHOT_FILE}.enrich.$$"; clobber_guard' EXIT
