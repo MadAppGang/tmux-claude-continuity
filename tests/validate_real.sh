@@ -32,9 +32,16 @@ else
 fi
 
 # ---- Run post_restore against real snapshot, isolated output --------------
+# CC_NO_NUDGE=1 is what makes "isolated" true. Without it this loop send-keys
+# Enter into every live pane it resolves — and those panes are running Claude,
+# so the Enter submits whatever is sitting half-typed in the prompt.
 tmux set-option -g @claude-continuity-pending-dir "$T/pending"
 tmux set-option -g @claude-continuity-log-file "$T/v.log"
-RESURRECT_FILE="$SNAP" bash "$INST/scripts/post_restore.sh"
+# CC_IGNORE_BUSY=1 as well: every live pane here is already running Claude, and
+# post_restore now refuses to arm those (that is what stops a manual restore from
+# writing into them). This script's whole purpose is to exercise pane RESOLUTION
+# against the real layout, so it opts out of the guard rather than resolving zero.
+CC_NO_NUDGE=1 CC_IGNORE_BUSY=1 RESURRECT_FILE="$SNAP" bash "$INST/scripts/post_restore.sh"
 tmux set-option -g @claude-continuity-pending-dir "$HOME/.config/tmux-claude/pending"
 tmux set-option -g @claude-continuity-log-file "$HOME/.tmux/scripts/claude-continuity-restore.log"
 
@@ -91,7 +98,7 @@ echo "[6] VERDICT: honest PASS with absent-session accounting"
 verdict=$(grep 'BOOT VERDICT' "$T/v.log")
 echo "      $verdict"
 if echo "$verdict" | grep -q 'PASS'; then ok "verdict PASS"; else no "verdict not PASS"; fi
-if echo "$verdict" | grep -qE 'resumed [0-9]+/[0-9]+ resumable'; then ok "verdict reports resumable denominator (not raw total)"; else no "verdict denominator wrong"; fi
+if echo "$verdict" | grep -qE 'queued [0-9]+/[0-9]+ resumable'; then ok "verdict reports resumable denominator (not raw total)"; else no "verdict denominator wrong"; fi
 # real misses must be 0 for a trustworthy PASS
 if grep -q 'REAL MISS' "$T/v.log"; then no "there are REAL MISSES (live session not resumed)"; else ok "0 real misses (no live session lost)"; fi
 

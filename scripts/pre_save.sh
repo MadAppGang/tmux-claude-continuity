@@ -135,8 +135,11 @@ declare_map_file="${SNAPSHOT_FILE}.sidmap.$$"
 # Keep the clobber_guard on EXIT and add temp-file cleanup ahead of it.
 trap 'rm -f "$declare_map_file" "${SNAPSHOT_FILE}.enrich.$$"; clobber_guard' EXIT
 
-tmux list-panes -a -F '#S	#I	#P	#{pane_pid}' 2>/dev/null | \
-while IFS=$'\t' read -r sess win pane shell_pid; do
+launch_dir="$(tmux show-option -gqv @claude-continuity-launch-dir 2>/dev/null)"
+launch_dir="${launch_dir:-$HOME/.config/tmux-claude/launch}"
+
+tmux list-panes -a -F '#S	#I	#P	#{pane_pid}	#{pane_id}' 2>/dev/null | \
+while IFS=$'\t' read -r sess win pane shell_pid pane_id; do
   [ -n "$shell_pid" ] || continue
   # Candidate PIDs: the pane process itself first (exec'd/resumed Claude), then
   # its direct children (Claude launched as a child of a non-exec shell).
@@ -164,7 +167,17 @@ while IFS=$'\t' read -r sess win pane shell_pid; do
     done
   fi
 
-  [ -n "$sid" ] && printf '%s:%s.%s\t%s\n' "$sess" "$win" "$pane" "$sid"
+  # The command as the user actually TYPED it, recorded by the preexec hook in
+  # claude-continuity.zsh (see there for why ps cannot supply this). Base64 so an
+  # arbitrary command line — quotes, tabs, anything — cannot break the snapshot's
+  # tab-separated line format. `base64` with no wrapping: -w0 is GNU, macOS
+  # doesn't accept it and doesn't wrap by default, so strip newlines instead.
+  launch_b64=""
+  if [ -n "$sid" ] && [ -n "$pane_id" ] && [ -f "${launch_dir}/${pane_id#%}" ]; then
+    launch_b64="$(base64 < "${launch_dir}/${pane_id#%}" 2>/dev/null | tr -d '\n')"
+  fi
+
+  [ -n "$sid" ] && printf '%s:%s.%s\t%s\t%s\n' "$sess" "$win" "$pane" "$sid" "$launch_b64"
 done > "$declare_map_file"
 
 # ── Enrich the snapshot ──────────────────────────────────────────────────────
@@ -186,8 +199,11 @@ EOF
   pane_target="${r_sess}:${r_win}.${r_pane}"
 
   matched_sid="$(awk -F'\t' -v t="$pane_target" '$1 == t {print $2; exit}' "$declare_map_file")"
+  matched_cmd="$(awk -F'\t' -v t="$pane_target" '$1 == t {print $3; exit}' "$declare_map_file")"
 
-  if [ -n "$matched_sid" ]; then
+  if [ -n "$matched_sid" ] && [ -n "$matched_cmd" ]; then
+    printf '%s\t%s\t;CLAUDE_SID=%s\t;CLAUDE_CMD=%s\n' "$line_type" "$rest" "$matched_sid" "$matched_cmd"
+  elif [ -n "$matched_sid" ]; then
     printf '%s\t%s\t;CLAUDE_SID=%s\n' "$line_type" "$rest" "$matched_sid"
   else
     printf '%s\t%s\n' "$line_type" "$rest"

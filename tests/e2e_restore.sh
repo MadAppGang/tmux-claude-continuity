@@ -7,6 +7,17 @@
 #
 # SAFETY: Never calls kill-server. Only kills sessions on the test socket.
 #
+# STALE — 7 of its 13 assertions have failed since the resume redesign, and are
+# unrelated to whatever you are changing right now (verified 2026-07-22: the same
+# 6 pass / 7 fail against the pre-change post_restore.sh). They assert two
+# behaviours the script deliberately dropped:
+#   - the command is send-keys'd into the pane (it is now written to a pending
+#     file that the pane's own precmd hook runs, so capture-pane shows nothing);
+#   - a missing CLAUDE_SID falls back to the position-keyed sidecar (removed on
+#     purpose: stale sidecars resumed dead sessions into non-Claude panes).
+# Use renumber_resolve.sh / dup_title_resolve.sh / wrapper_replay.sh as the
+# regression suite. This file needs rewriting against the pending-file design.
+#
 # Usage: bash tests/e2e_restore.sh
 # Exit code: 0 = all pass, 1 = failure
 
@@ -16,6 +27,12 @@ SOCKET="tctest$$"
 PANES_DIR="/tmp/tctest-panes-$$"
 RESURRECT_DIR="/tmp/tctest-resurrect-$$"
 RESURRECT_FILE="$RESURRECT_DIR/last"
+# Redirect the pending dir and the log too, or the test writes pending resumes
+# into the LIVE ~/.config/tmux-claude/pending under test-server pane ids (%0, %1
+# — exactly the ids a real fresh server hands out) and appends test noise to the
+# production restore log. Both were happening before 2026-07-22.
+PENDING_DIR="/tmp/tctest-pending-$$"
+LOG_FILE="/tmp/tctest-$$.log"
 SCRIPT_DIR="$(cd "$(dirname "$0")/../scripts" && pwd)"
 RESTORE_SCRIPT="$SCRIPT_DIR/post_restore.sh"
 TEST_CMD="echo"
@@ -31,7 +48,7 @@ _cleanup_test_socket() {
 
 cleanup() {
   _cleanup_test_socket
-  rm -rf "$PANES_DIR" "$RESURRECT_DIR"
+  rm -rf "$PANES_DIR" "$RESURRECT_DIR" "$PENDING_DIR" "$LOG_FILE"
 }
 trap cleanup EXIT
 
@@ -74,11 +91,18 @@ _fresh_server() {
   local num_windows="${1:-1}"
   _cleanup_test_socket
   rm -f "$PANES_DIR"/*.session-id 2>/dev/null
-  tmux -L "$SOCKET" new-session -d -s work -c /tmp
+  # `-f /dev/null` is NOT optional. A separate -L socket is not isolation: a new
+  # server still sources ~/.tmux.conf, which fires continuum-safe-restore and
+  # restores the REAL session layout into this test server (and, worse, lets its
+  # post_restore write pending files for live panes). -f /dev/null gives a server
+  # with no user config at all.
+  tmux -L "$SOCKET" -f /dev/null new-session -d -s work -c /tmp
   local i
   for ((i = 2; i <= num_windows; i++)); do
     tmux -L "$SOCKET" new-window -t work -c /tmp
   done
+  tmux -L "$SOCKET" set-option -g @claude-continuity-pending-dir "$PENDING_DIR"
+  tmux -L "$SOCKET" set-option -g @claude-continuity-log-file "$LOG_FILE"
   tmux -L "$SOCKET" set-option -g @claude-continuity-claude-cmd "$TEST_CMD"
   tmux -L "$SOCKET" set-option -g @claude-continuity-panes-dir "$PANES_DIR"
   tmux -L "$SOCKET" set-option -g @claude-continuity-restore-delay "0"
