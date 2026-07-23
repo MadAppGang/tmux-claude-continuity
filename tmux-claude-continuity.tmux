@@ -11,9 +11,11 @@
 #   @claude-continuity-pending-dir   Where post_restore queues pending resumes for
 #                                    the claude-continuity.zsh precmd hook to read
 #                                    Default: ~/.config/tmux-claude/pending
-#   @claude-continuity-claude-cmd    Command used to (re)launch claude. A bare
-#                                    alias like "c" is expanded to its binary form
-#                                    at restore time. Default: claude
+#   @claude-continuity-claude-cmd    Command used to (re)launch claude, used
+#                                    EXACTLY as written — an alias ("c"), a shell
+#                                    function, a binary, or a full command line.
+#                                    The precmd evals it, so aliases and functions
+#                                    resolve normally. Default: claude
 #
 # Resume is driven by a zsh precmd hook (claude-continuity.zsh), NOT by timed
 # send-keys. Source it from ~/.zshrc:
@@ -22,6 +24,12 @@
 # on the shell's first real prompt, so there is no delay to tune).
 
 CURRENT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Register the pre-restore hook for tmux-resurrect. It purges stale pending
+# resumes before any pane exists — the only point at which that is still safe.
+# Note: @resurrect-hook-pre-restore-all is undocumented but confirmed in restore.sh:369
+tmux set-option -g @resurrect-hook-pre-restore-all \
+  "${CURRENT_DIR}/scripts/pre_restore.sh"
 
 # Register the post-restore hook for tmux-resurrect
 # Note: @resurrect-hook-post-restore-all is undocumented but confirmed in restore.sh:382
