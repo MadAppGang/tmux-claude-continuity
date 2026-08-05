@@ -57,6 +57,21 @@ pending_dir="${pending_dir:-$HOME/.config/tmux-claude/pending}"
 claude_cmd="$($TMUX_CMD show-option -gqv @claude-continuity-claude-cmd 2>/dev/null)"
 claude_cmd="${claude_cmd:-claude}"
 
+# Base command for restoring CLAUDISH panes. Defaults to bare `claudish` — how the
+# user launches it by hand. The precmd runs `eval "<cmd>"` (no exec, see
+# claude-continuity.zsh) inside the fully-sourced interactive zsh, so bare
+# `claudish` resolves on PATH and its provider keys load exactly as in a hand-
+# typed invocation. Override with @claude-continuity-claudish-cmd.
+claudish_cmd="$($TMUX_CMD show-option -gqv @claude-continuity-claudish-cmd 2>/dev/null)"
+claudish_cmd="${claudish_cmd:-claudish}"
+
+# Optional: extra non-Claude programs to relaunch verbatim after a restore
+# (e.g. "codex lazygit btop"). Space-separated argv[0] basenames. A snapshot row
+# whose command's first word matches is relaunched with its FULL saved command
+# via the same pending-file + precmd path Claude panes use (no send-keys race).
+# Empty by default — nothing extra is restored.
+restore_procs="$($TMUX_CMD show-option -gqv @claude-continuity-restore-procs 2>/dev/null)"
+
 # The configured command is used EXACTLY as written. No path resolution, no
 # alias expansion, no rewriting: what you would type is what a restored pane runs.
 #
@@ -305,6 +320,7 @@ done
 
 base_cmd="$claude_cmd"
 _cc_written=0
+_cc_proc_written=0     # non-Claude programs (@claude-continuity-restore-procs) relaunched
 _cc_skipped_absent=0    # SID rows whose session no longer exists live (benign)
 _cc_skipped_present=0   # SID rows whose session IS live but didn't resolve (real miss)
 _cc_skipped_busy=0      # rows whose pane is already running something (manual restore)
@@ -357,8 +373,12 @@ EOF
 }
 
 # Queue a pending resume for each pane that was running claude.
+# extra1..extra3 must cover EVERY sentinel pre_save can append, because `read`
+# stuffs all remaining input into its last variable: with only two slots, a row
+# carrying SID + CMD + CLAUDISH_REPLAY would leave the third glued onto the
+# second, and the `case` below would silently match neither.
 while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
-        pane_title dir pane_active pane_cmd pane_full_cmd extra1 extra2; do
+        pane_title dir pane_active pane_cmd pane_full_cmd extra1 extra2 extra3; do
   [ "$line_type" = "pane" ] || continue
 
   # Strip leading ":" sentinel from full command field
@@ -369,10 +389,12 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   # is the AUTHORITATIVE marker that this pane is a Claude session.
   resume_token=""
   typed_cmd_b64=""
-  for field in "$extra1" "$extra2"; do
+  claudish_replay=""
+  for field in "$extra1" "$extra2" "$extra3"; do
     case "$field" in
-      ";CLAUDE_SID="*) resume_token="${field#;CLAUDE_SID=}" ;;
-      ";CLAUDE_CMD="*) typed_cmd_b64="${field#;CLAUDE_CMD=}" ;;
+      ";CLAUDE_SID="*)      resume_token="${field#;CLAUDE_SID=}" ;;
+      ";CLAUDE_CMD="*)      typed_cmd_b64="${field#;CLAUDE_CMD=}" ;;
+      ";CLAUDISH_REPLAY="*) claudish_replay="${field#;CLAUDISH_REPLAY=}" ;;
     esac
   done
 
@@ -392,7 +414,18 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   # The configured-command test is whole-token (see _cc_matches_configured_cmd):
   # a substring test would qualify nearly every pane once the configured command
   # is a short alias like `c`.
-  if [ -z "$resume_token" ] \
+  # Does this row's command match a configured extra program (codex, lazygit, …)?
+  # First word of the full command, basename only. Only meaningful when there is
+  # NO resume token — a Claude/claudish pane is never a "restore_proc".
+  restore_proc_cmd=""
+  if [ -z "$resume_token" ] && [ -n "$restore_procs" ]; then
+    _cc_first="${full_cmd%% *}"; _cc_first="${_cc_first##*/}"
+    for _rp in $restore_procs; do
+      [ "$_cc_first" = "$_rp" ] && { restore_proc_cmd="$full_cmd"; break; }
+    done
+  fi
+
+  if [ -z "$resume_token" ] && [ -z "$restore_proc_cmd" ] \
      && [[ "$full_cmd" != *"claude"* ]] && ! _cc_matches_configured_cmd "$full_cmd"; then
     continue
   fi
@@ -526,9 +559,22 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
     fi
   fi
 
-  if [ -n "$resume_token" ]; then
+  if [ -n "$claudish_replay" ] && [ -n "$resume_token" ]; then
+    # Claudish pane: relaunch through `claudish` with the saved flags so the model
+    # provider/proxy is reconstructed. A bare `claude --resume` here would resume
+    # the transcript against the REAL Anthropic API instead — wrong account, wrong
+    # model. The replay flags already carry the model (explicit or injected).
+    printf '%s %s --resume %s\n' "$claudish_cmd" "$claudish_replay" "$resume_token" > "$pane_key_file"
+    _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') claudish resume=$resume_token [$claudish_replay]"
+  elif [ -n "$resume_token" ]; then
     printf '%s --resume %s\n' "$relaunch" "$resume_token" > "$pane_key_file"
     _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') resume=$resume_token cmd=$relaunch_kind"
+  elif [ -n "$restore_proc_cmd" ]; then
+    # Non-Claude program (codex, lazygit, …): relaunch its full saved command
+    # through the same pending-file path, so it is subject to no send-keys race.
+    printf '%s\n' "$restore_proc_cmd" > "$pane_key_file"
+    _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') proc=[$restore_proc_cmd]"
+    _cc_proc_written=$((_cc_proc_written + 1))
   else
     printf '%s\n' "$relaunch" > "$pane_key_file"
     _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') bare (no token) cmd=$relaunch_kind"
@@ -650,4 +696,4 @@ else
       >> "${LOG_FILE%.log}-incomplete.log"; } 2>/dev/null || true
 fi
 
-_cc_log "post_restore DONE: wrote $_cc_written pending resume file(s)"
+_cc_log "post_restore DONE: wrote $_cc_written pending resume file(s), $_cc_proc_written extra process(es)"

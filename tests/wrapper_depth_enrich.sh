@@ -138,6 +138,25 @@ write_snapshot
 PATH="$BIN:$PATH" bash "$PRE_SAVE" "$SNAP"
 assert_eq "shallower (child) SID wins over deeper (grandchild)" "$(sid_in_snapshot)" "$SID_CHILD"
 
+# ── 4b. The typed-command capture must survive alongside the SID ─────────────
+# ;CLAUDE_CMD carries the command as the user actually typed it (1b4e32a). It is
+# a separate snapshot field from ;CLAUDE_SID and rides the same sidmap row, so a
+# change to the SID lookup can silently drop it — which would restore every pane
+# as the configured default instead of its own launcher.
+echo "[4b] TYPED COMMAND: ;CLAUDE_CMD rides along with ;CLAUDE_SID"
+rm -f "$PD/by-pid/"*.session-id
+echo "$SID_GRAND" > "$PD/by-pid/$GRANDCHILD.session-id"
+PANE_ID="$(_tmux list-panes -a -F '#{pane_id}' | head -1)"
+printf 'c --worktree qr --name "My Session"\n' > "$LD/${PANE_ID#%}"
+write_snapshot
+PATH="$BIN:$PATH" bash "$PRE_SAVE" "$SNAP"
+CMD_B64="$(awk -F'\t' '$1=="pane"{for(i=1;i<=NF;i++) if($i ~ /^;CLAUDE_CMD=/) print substr($i,13)}' "$SNAP" | head -1)"
+assert_eq "typed command embedded and decodes verbatim" \
+  "$(printf '%s' "$CMD_B64" | base64 -d 2>/dev/null || printf '%s' "$CMD_B64" | base64 -D 2>/dev/null)" \
+  'c --worktree qr --name "My Session"'
+assert_eq "SID still embedded alongside it" "$(sid_in_snapshot)" "$SID_GRAND"
+rm -f "$LD/${PANE_ID#%}"
+
 # ── 5. A process belonging to no pane must never be attributed ───────────────
 echo "[5] NO FALSE ATTRIBUTION: an unrelated process claims nothing"
 rm -f "$PD/by-pid/"*.session-id

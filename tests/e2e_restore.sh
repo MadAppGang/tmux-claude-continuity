@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
 # e2e_restore.sh — end-to-end test for post_restore.sh
 #
-# Runs the REAL post_restore.sh script against an isolated tmux socket.
-# Uses "echo" as claude_cmd so pane output shows the exact command
-# that would be sent (e.g. "echo --resume session-aaa").
+# Runs the REAL post_restore.sh against an isolated tmux socket and asserts on
+# the restore LOG (post_restore's authoritative record of what it routed where).
 #
-# SAFETY: Never calls kill-server. Only kills sessions on the test socket.
+# WHY THE LOG, NOT PANE OUTPUT: current post_restore does NOT send the command
+# via send-keys — it writes a per-pane "pending resume" file that the pane's own
+# precmd hook consumes on first prompt. So the command never appears in captured
+# pane output, and the pending file is race-consumed by the pane's zsh. The log's
+# WROTE/SKIP lines are the stable, authoritative record (same approach as
+# dup_title_resolve.sh). Resume tokens come ONLY from the snapshot's
+# ;CLAUDE_SID=<uuid> field — post_restore deliberately ignores position-keyed
+# sidecar files (they drift), so fixtures embed the SID in the row, not a file.
 #
-# STALE — 7 of its 13 assertions have failed since the resume redesign, and are
-# unrelated to whatever you are changing right now (verified 2026-07-22: the same
-# 6 pass / 7 fail against the pre-change post_restore.sh). They assert two
-# behaviours the script deliberately dropped:
-#   - the command is send-keys'd into the pane (it is now written to a pending
-#     file that the pane's own precmd hook runs, so capture-pane shows nothing);
-#   - a missing CLAUDE_SID falls back to the position-keyed sidecar (removed on
-#     purpose: stale sidecars resumed dead sessions into non-Claude panes).
-# Use renumber_resolve.sh / dup_title_resolve.sh / wrapper_replay.sh as the
-# regression suite. This file needs rewriting against the pending-file design.
+# SAFETY (a plain `tmux -L x new-session` sources ~/.tmux.conf, whose continuum
+# auto-restore then restores the user's ENTIRE real layout into the test server —
+# duplicating every claude and arming a timer that clobbers the real snapshot):
+#   * -f /dev/null           -> config-free server, no hooks, no auto-restore
+#   * pending/log/panes/resurrect dirs all redirected under $TMPROOT
+#   * isolation asserted (exactly one session) before any test runs
+#   * never kill-server; only kill sessions on our own socket
 #
 # Usage: bash tests/e2e_restore.sh
 # Exit code: 0 = all pass, 1 = failure
@@ -24,15 +27,12 @@
 set -uo pipefail
 
 SOCKET="tctest$$"
-PANES_DIR="/tmp/tctest-panes-$$"
-RESURRECT_DIR="/tmp/tctest-resurrect-$$"
+TMPROOT="/tmp/tctest-$$"
+PANES_DIR="$TMPROOT/panes"
+PENDING_DIR="$TMPROOT/pending"
+RESURRECT_DIR="$TMPROOT/resurrect"
 RESURRECT_FILE="$RESURRECT_DIR/last"
-# Redirect the pending dir and the log too, or the test writes pending resumes
-# into the LIVE ~/.config/tmux-claude/pending under test-server pane ids (%0, %1
-# — exactly the ids a real fresh server hands out) and appends test noise to the
-# production restore log. Both were happening before 2026-07-22.
-PENDING_DIR="/tmp/tctest-pending-$$"
-LOG_FILE="/tmp/tctest-$$.log"
+LOG_FILE="$TMPROOT/restore.log"
 SCRIPT_DIR="$(cd "$(dirname "$0")/../scripts" && pwd)"
 RESTORE_SCRIPT="$SCRIPT_DIR/post_restore.sh"
 TEST_CMD="echo"
@@ -40,233 +40,160 @@ TEST_CMD="echo"
 pass=0
 fail=0
 
+case "$SOCKET" in default|"") echo "unsafe socket label"; exit 1 ;; esac
+
+_t() { tmux -L "$SOCKET" "$@"; }
+
 _cleanup_test_socket() {
-  for s in $(tmux -L "$SOCKET" list-sessions -F '#{session_name}' 2>/dev/null); do
-    tmux -L "$SOCKET" kill-session -t "$s" 2>/dev/null
+  for s in $(_t list-sessions -F '#{session_name}' 2>/dev/null); do
+    _t kill-session -t "$s" 2>/dev/null
   done
 }
 
 cleanup() {
   _cleanup_test_socket
-  rm -rf "$PANES_DIR" "$RESURRECT_DIR" "$PENDING_DIR" "$LOG_FILE"
+  # Kill any lingering server bound to OUR socket label only. $2 must literally be
+  # tmux, else this awk matches its own `-L <socket>` command line and self-kills.
+  for p in $(ps -Ao pid,command= | awk -v s="-L $SOCKET" '$2 ~ /(^|\/)tmux$/ && index($0,s){print $1}'); do
+    kill "$p" 2>/dev/null
+  done
+  rm -rf "$TMPROOT"
 }
 trap cleanup EXIT
 
-assert_contains() {
-  local label="$1" haystack="$2" needle="$3"
-  if [[ "$haystack" == *"$needle"* ]]; then
-    echo "  PASS: $label"
-    ((pass++))
+# ── Assertions (all operate on the restore log unless noted) ──────────────────
+_log() { cat "$LOG_FILE" 2>/dev/null; }
+
+assert_log_has() {
+  local label="$1" needle="$2"
+  if _log | grep -qF "$needle"; then
+    echo "  PASS: $label"; pass=$((pass+1))
   else
-    echo "  FAIL: $label"
-    echo "    expected to contain: $needle"
-    echo "    got: $(echo "$haystack" | head -3)"
-    ((fail++))
+    echo "  FAIL: $label"; echo "    expected log to contain: $needle"
+    _log | sed 's/^/      log| /'; fail=$((fail+1))
   fi
 }
 
-assert_not_contains() {
-  local label="$1" haystack="$2" needle="$3"
-  if [[ "$haystack" != *"$needle"* ]]; then
-    echo "  PASS: $label"
-    ((pass++))
+assert_log_lacks() {
+  local label="$1" needle="$2"
+  if _log | grep -qF "$needle"; then
+    echo "  FAIL: $label (log unexpectedly contains: $needle)"
+    _log | sed 's/^/      log| /'; fail=$((fail+1))
   else
-    echo "  FAIL: $label (unexpectedly contains: $needle)"
-    ((fail++))
+    echo "  PASS: $label"; pass=$((pass+1))
   fi
 }
 
 assert_not_exists() {
   local label="$1" path="$2"
-  if [ ! -e "$path" ]; then
-    echo "  PASS: $label"
-    ((pass++))
-  else
-    echo "  FAIL: $label (file still exists: $path)"
-    ((fail++))
-  fi
+  if [ ! -e "$path" ]; then echo "  PASS: $label"; pass=$((pass+1))
+  else echo "  FAIL: $label (file still exists: $path)"; fail=$((fail+1)); fi
 }
 
+# ── Isolated server ───────────────────────────────────────────────────────────
 _fresh_server() {
   local num_windows="${1:-1}"
   _cleanup_test_socket
-  rm -f "$PANES_DIR"/*.session-id 2>/dev/null
-  # `-f /dev/null` is NOT optional. A separate -L socket is not isolation: a new
-  # server still sources ~/.tmux.conf, which fires continuum-safe-restore and
-  # restores the REAL session layout into this test server (and, worse, lets its
-  # post_restore write pending files for live panes). -f /dev/null gives a server
-  # with no user config at all.
-  tmux -L "$SOCKET" -f /dev/null new-session -d -s work -c /tmp
+  rm -rf "$PANES_DIR" "$PENDING_DIR"; mkdir -p "$PANES_DIR/by-pid" "$PENDING_DIR"
+  : > "$LOG_FILE"   # each test asserts only on its own restore
+  _t -f /dev/null new-session -d -s work -c /tmp
   local i
   for ((i = 2; i <= num_windows; i++)); do
-    tmux -L "$SOCKET" new-window -t work -c /tmp
+    _t new-window -t work -c /tmp
   done
-  tmux -L "$SOCKET" set-option -g @claude-continuity-pending-dir "$PENDING_DIR"
-  tmux -L "$SOCKET" set-option -g @claude-continuity-log-file "$LOG_FILE"
-  tmux -L "$SOCKET" set-option -g @claude-continuity-claude-cmd "$TEST_CMD"
-  tmux -L "$SOCKET" set-option -g @claude-continuity-panes-dir "$PANES_DIR"
-  tmux -L "$SOCKET" set-option -g @claude-continuity-restore-delay "0"
+  _t set-option -g @claude-continuity-claude-cmd   "$TEST_CMD"
+  _t set-option -g @claude-continuity-panes-dir    "$PANES_DIR"
+  _t set-option -g @claude-continuity-pending-dir  "$PENDING_DIR"
+  _t set-option -g @claude-continuity-log-file     "$LOG_FILE"
+  _t set-option -g @resurrect-dir                  "$RESURRECT_DIR"
 }
 
-# Run the REAL post_restore.sh, pointed at the test socket and test files
+# Emit a snapshot pane row from the Nth live pane's REAL (window,pane,cwd,title)
+# so post_restore's content-resolution matches. Args: N full_cmd [sid]
+# Reads the live layout each call (cheap; test panes are few).
+_row_from_live() {
+  local n="$1" full_cmd="$2" sid="${3:-}"
+  local i=0 w p cwd title
+  while IFS='|' read -r lw lp _lid lcwd ltitle; do
+    i=$((i+1)); [ "$i" = "$n" ] || continue
+    w="$lw"; p="$lp"; cwd="$lcwd"; title="$ltitle"; break
+  done < <(_t list-panes -a -F '#{window_index}|#{pane_index}|#{pane_id}|#{pane_current_path}|#{pane_title}')
+  # tmux-resurrect pane layout: pane <sess> <win> <win_active> <win_flags>
+  #   <pane_idx> <title> :<cwd> <pane_active> <cmd> :<full_cmd> [;CLAUDE_SID=..]
+  if [ -n "$sid" ]; then
+    printf 'pane\twork\t%s\t1\t:*\t%s\t%s\t:%s\t1\t%s\t:%s\t;CLAUDE_SID=%s\n' \
+      "$w" "$p" "$title" "$cwd" "$full_cmd" "$full_cmd" "$sid"
+  else
+    printf 'pane\twork\t%s\t1\t:*\t%s\t%s\t:%s\t1\t%s\t:%s\n' \
+      "$w" "$p" "$title" "$cwd" "$full_cmd" "$full_cmd"
+  fi
+}
+
 _run_restore() {
-  TMUX_CMD="tmux -L $SOCKET" \
-  RESURRECT_FILE="$RESURRECT_FILE" \
-    bash "$RESTORE_SCRIPT"
+  TMUX_CMD="tmux -L $SOCKET" RESURRECT_FILE="$RESURRECT_FILE" bash "$RESTORE_SCRIPT"
 }
 
-_capture() {
-  tmux -L "$SOCKET" capture-pane -t "$1" -p 2>/dev/null
-}
+mkdir -p "$TMPROOT" "$RESURRECT_DIR"
 
-# ── Setup ────────────────────────────────────────────────────────────────────
-
-mkdir -p "$PANES_DIR" "$RESURRECT_DIR"
-
-# ── Test 1: Resume with session IDs ─────────────────────────────────────────
-
-echo "Test 1: Panes with sidecar files get --resume"
-
-_fresh_server 2
-
-echo "session-aaa" > "$PANES_DIR/work-1-1.session-id"
-echo "session-bbb" > "$PANES_DIR/work-2-1.session-id"
-
-printf 'pane\twork\t1\t1\t:*\t1\tClaude Code\t/tmp\t1\tclaude\t:claude --dangerously-skip-permissions\n' > "$RESURRECT_FILE"
-printf 'pane\twork\t2\t0\t:-\t1\tClaude Code\t/tmp\t1\tclaude\t:claude --dangerously-skip-permissions\n' >> "$RESURRECT_FILE"
-
-_run_restore
-sleep 0.5
-
-pane1="$(_capture work:1.1)"
-pane2="$(_capture work:2.1)"
-
-assert_contains "pane 1 resumes with session id" "$pane1" "--resume session-aaa"
-assert_contains "pane 2 resumes with session id" "$pane2" "--resume session-bbb"
-
-# ── Test 2: Orphan cleanup ──────────────────────────────────────────────────
-
-echo "Test 2: Orphan sidecar files are removed"
-
+# ── Isolation gate ────────────────────────────────────────────────────────────
 _fresh_server 1
+n_sess="$(_t list-sessions 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$n_sess" = "1" ]; then
+  echo "Isolation: PASS (test server has exactly 1 session)"
+else
+  echo "Isolation: FAIL — $n_sess sessions; user config leaked in. ABORT."
+  exit 1
+fi
 
-echo "good-session" > "$PANES_DIR/work-1-1.session-id"
-echo "orphan-session" > "$PANES_DIR/oldwork-9-1.session-id"
-
-printf 'pane\twork\t1\t1\t:*\t1\tClaude Code\t/tmp\t1\tclaude\t:claude\n' > "$RESURRECT_FILE"
-
+# ── Test 1: rows with ;CLAUDE_SID resume with that token ─────────────────────
+echo "Test 1: snapshot CLAUDE_SID -> resume token"
+_fresh_server 2
+{ _row_from_live 1 claude session-aaa
+  _row_from_live 2 claude session-bbb; } > "$RESURRECT_FILE"
 _run_restore
+assert_log_has  "pane 1 resumes with session-aaa" "resume=session-aaa"
+assert_log_has  "pane 2 resumes with session-bbb" "resume=session-bbb"
 
+# ── Test 2: orphan position sidecars are garbage-collected ───────────────────
+echo "Test 2: orphan sidecar files removed"
+_fresh_server 1
+echo "good"   > "$PANES_DIR/work-1-1.session-id"
+echo "orphan" > "$PANES_DIR/oldwork-9-1.session-id"
+_row_from_live 1 claude > "$RESURRECT_FILE"
+_run_restore
 assert_not_exists "orphan sidecar removed" "$PANES_DIR/oldwork-9-1.session-id"
 
-# ── Test 3: Missing sidecar → bare command ───────────────────────────────────
-
-echo "Test 3: No sidecar file → bare command (no --resume)"
-
+# ── Test 3: claude row with no SID -> bare (no token) ────────────────────────
+echo "Test 3: no CLAUDE_SID -> bare command"
 _fresh_server 1
-
-printf 'pane\twork\t1\t1\t:*\t1\tClaude Code\t/tmp\t1\tclaude\t:claude\n' > "$RESURRECT_FILE"
-
+_row_from_live 1 claude > "$RESURRECT_FILE"
 _run_restore
-sleep 0.5
+assert_log_has   "bare write logged"   "bare (no token)"
+assert_log_lacks "no resume token"     "resume="
 
-pane_bare="$(_capture work:1.1)"
-assert_contains "bare cmd sent" "$pane_bare" "echo"
-assert_not_contains "no --resume flag" "$pane_bare" "--resume"
-
-# ── Test 4: Empty sidecar → bare command ─────────────────────────────────────
-
-echo "Test 4: Empty sidecar file → bare command"
-
-_fresh_server 1
-> "$PANES_DIR/work-1-1.session-id"
-
-printf 'pane\twork\t1\t1\t:*\t1\tClaude Code\t/tmp\t1\tclaude\t:claude\n' > "$RESURRECT_FILE"
-
-_run_restore
-sleep 0.5
-
-pane_empty="$(_capture work:1.1)"
-assert_not_contains "empty sidecar → no --resume" "$pane_empty" "--resume"
-
-# ── Test 5: Non-claude panes are skipped ─────────────────────────────────────
-
-echo "Test 5: Non-claude panes are not touched"
-
+# ── Test 4: non-claude row with no SID is skipped; claude row resumes ────────
+echo "Test 4: non-claude pane skipped, claude pane resumed"
 _fresh_server 2
-
-printf 'pane\twork\t1\t1\t:*\t1\tshell\t/tmp\t1\tzsh\t:zsh\n' > "$RESURRECT_FILE"
-printf 'pane\twork\t2\t0\t:-\t1\tClaude Code\t/tmp\t1\tclaude\t:claude\n' >> "$RESURRECT_FILE"
-
-echo "session-ccc" > "$PANES_DIR/work-2-1.session-id"
-
+{ _row_from_live 1 zsh
+  _row_from_live 2 claude session-ccc; } > "$RESURRECT_FILE"
 _run_restore
-sleep 0.5
+assert_log_has  "claude pane resumed" "resume=session-ccc"
+# The zsh row (no SID, full_cmd != claude) must never be written.
+assert_log_lacks "zsh pane not written as bare" "zsh"
 
-pane_zsh="$(_capture work:1.1)"
-pane_claude="$(_capture work:2.1)"
-
-assert_not_contains "zsh pane not touched (no --resume)" "$pane_zsh" "--resume"
-assert_not_contains "zsh pane not touched (no echo)" "$pane_zsh" "$ echo"
-assert_contains "claude pane resumed" "$pane_claude" "--resume session-ccc"
-
-# ── Test 6: Custom alias detection ───────────────────────────────────────────
-
-echo "Test 6: Pane with custom alias (not 'claude') is detected"
-
+# ── Test 5: custom claude-cmd qualifies a non-'claude' pane name ─────────────
+echo "Test 5: custom @claude-continuity-claude-cmd qualifies the pane"
 _fresh_server 1
-tmux -L "$SOCKET" set-option -g @claude-continuity-claude-cmd "myalias"
-
-echo "session-ddd" > "$PANES_DIR/work-1-1.session-id"
-
-printf 'pane\twork\t1\t1\t:*\t1\tClaude Code\t/tmp\t1\tmyalias\t:myalias\n' > "$RESURRECT_FILE"
-
+_t set-option -g @claude-continuity-claude-cmd "myalias"
+# full_cmd is 'myalias' (not 'claude') and there is NO SID: the pane qualifies
+# ONLY via the claude-cmd match, exercising that fallback. It resumes bare.
+_row_from_live 1 myalias > "$RESURRECT_FILE"
 _run_restore
-sleep 0.5
-
-pane_alias="$(_capture work:1.1)"
-assert_contains "custom alias with --resume" "$pane_alias" "myalias --resume session-ddd"
-
-# ── Test 7: Two-line sidecar (UUID + title) uses UUID ────────────────────────
-
-echo "Test 7: Two-line sidecar uses UUID from line 1, not title from line 2"
-
-_fresh_server 1
-tmux -L "$SOCKET" set-option -g @claude-continuity-claude-cmd "$TEST_CMD"
-
-printf '%s\n%s\n' "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" "my-custom-title" \
-  > "$PANES_DIR/work-1-1.session-id"
-
-printf 'pane\twork\t1\t1\t:*\t1\tClaude Code\t/tmp\t1\tclaude\t:claude\n' > "$RESURRECT_FILE"
-
-_run_restore
-sleep 0.5
-
-pane_titled="$(_capture work:1.1)"
-assert_contains "uses UUID from line 1" "$pane_titled" "--resume aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-assert_not_contains "does not use title" "$pane_titled" "my-custom-title"
-
-# ── Test 8: Legacy single-line title sidecar still works ─────────────────────
-
-echo "Test 8: Legacy sidecar with title (no UUID) falls back to title as search term"
-
-_fresh_server 1
-
-echo "bugfix-sentry" > "$PANES_DIR/work-1-1.session-id"
-
-printf 'pane\twork\t1\t1\t:*\t1\tClaude Code\t/tmp\t1\tclaude\t:claude\n' > "$RESURRECT_FILE"
-
-_run_restore
-sleep 0.5
-
-pane_legacy="$(_capture work:1.1)"
-assert_contains "legacy title used as search term" "$pane_legacy" "--resume bugfix-sentry"
+assert_log_has "custom-cmd pane written" "bare (no token)"
 
 # ── Results ──────────────────────────────────────────────────────────────────
-
 echo ""
 echo "═══════════════════════════════════"
 echo "  Results: $pass passed, $fail failed"
 echo "═══════════════════════════════════"
-
 [ "$fail" -eq 0 ]

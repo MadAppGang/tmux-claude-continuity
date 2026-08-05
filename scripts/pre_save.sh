@@ -172,6 +172,17 @@ awk -v panes="$panes_file" -v pstab="$ps_file" '
   FILENAME == pstab {
     if ($1 == "" || $2 == "") next
     parent[$1] = $2
+
+    # An MCP/headless helper. A Claude pane hosts its own MCP servers (claudish
+    # --mcp, mnemex --mcp, railway mcp, a python mcp-server.py) and those can
+    # themselves spawn Claude, so a session registered UNDER one is not the
+    # pane. Marked here, pruned during the climb.
+    if ($0 ~ /--mcp([ ]|$)/ || $0 ~ /mcp-server/ || $0 ~ /[ ]mcp([ ]|$)/) ismcp[$1] = 1
+
+    # A claudish LAUNCHER: its path ends in `/claudish` (the bin symlink), which
+    # is what makes `${argv##*/claudish}` yield clean flags. Deliberately NOT the
+    # bun `…/claudish/dist/index.js` child, and never an --mcp helper.
+    else if ($0 ~ /\/claudish([ ]|$)/) isclaudish[$1] = 1
     # SOURCE 2 (cmdline fallback): scrape `--resume <uuid>` from the args.
     # Catches RESUMED sessions whose SessionStart hook never registered a
     # sidecar (hook timing / send-keys relaunch). Independent of the hook
@@ -197,46 +208,78 @@ awk -v panes="$panes_file" -v pstab="$ps_file" '
     next
   }
 
-  # Climb from pid to the pane that owns it. Returns "" if it never reaches one
-  # (a detached process, or one belonging to a pane that has since closed).
-  function owner(pid,   cur, i) {
+  # Climb from pid to the pane that owns it, in ONE walk that answers all three
+  # questions the caller needs: which pane, how deep, and whether a claudish
+  # launcher sits on the path. Sets the globals _o/_d/_cl rather than returning a
+  # tuple (awk has no structs, and three separate walks would triple the work).
+  #
+  # Returns "" in _o when the pid reaches no pane — a detached process, or one
+  # whose pane has since closed — and ALSO when the path crosses an MCP helper:
+  # such a session belongs to the helper, not to the pane hosting it.
+  function climb(pid,   cur, i) {
+    _o = ""; _d = -1; _cl = ""
     cur = pid
     for (i = 0; i < 24; i++) {
-      if (cur in target) return cur
-      if (!(cur in parent)) return ""
-      if (parent[cur] == cur || parent[cur] == "0" || parent[cur] == "1") return ""
+      if (cur in ismcp) return
+      if (cur in target) { _o = cur; _d = i; return }
+      if (cur in isclaudish && _cl == "") _cl = cur
+      if (!(cur in parent)) return
+      if (parent[cur] == cur || parent[cur] == "0" || parent[cur] == "1") return
       cur = parent[cur]
     }
-    return ""
   }
-  function depth(pid,   cur, i) {
-    cur = pid
-    for (i = 0; i < 24; i++) {
-      if (cur in target) return i
-      if (!(cur in parent)) return -1
-      cur = parent[cur]
-    }
-    return -1
-  }
-  function claim(pid, sid,   o, d) {
-    o = owner(pid); if (o == "") return
-    d = depth(pid)
+  function claim(pid, sid,   o, d, cl) {
+    climb(pid); o = _o; d = _d; cl = _cl
+    if (o == "") return
     if (o in best && bestdepth[o] <= d) return
-    best[o] = sid; bestdepth[o] = d
+    best[o] = sid; bestdepth[o] = d; bestpid[o] = pid; bestclaudish[o] = cl
   }
+  function owned(pid) { climb(pid); return _o }
 
   END {
     # SOURCE 1 (registry): the by-pid sidecar written by on_session_start.sh.
     # Authoritative when the SessionStart hook fired — also covers FRESH
-    # sessions (a plain `claude` with no --resume flag), which have no SID on
-    # the cmdline and are invisible to SOURCE 2.
+    # sessions (a plain `claude`, or an interactive claudish, with no --resume
+    # on the cmdline), which are invisible to SOURCE 2.
     for (pid in registered) claim(pid, registered[pid])
-    for (pid in scraped) if (!(owner(pid) in best)) claim(pid, scraped[pid])
-    for (pp in best) print target[pp] "\t" paneid[pp] "\t" best[pp]
+    for (pid in scraped) if (!(owned(pid) in best)) claim(pid, scraped[pid])
+    # <target> <pane id> <sid> <winning pid> <claudish launcher pid, or empty>
+    for (pp in best)
+      print target[pp] "\t" paneid[pp] "\t" best[pp] "\t" bestpid[pp] "\t" bestclaudish[pp]
   }
 ' "$panes_file" "$ps_file" "$@" > "$registry_file"
 
-while IFS=$'\t' read -r pane_target pane_id sid; do
+# Given a claudish LAUNCHER argv, produce the flags to replay after the base
+# `claudish` command, and (for interactive single-model sessions) the resolved
+# --model to inject. The rule mirrors how the user thinks about it:
+#   * argv already carries --model/--model-<role>/-m/--profile  -> replay verbatim
+#     (an explicit model, or a profile's whole role mapping — never collapse it).
+#   * argv carries none of those -> it was an interactive pick of ONE model, which
+#     survives only in CLAUDISH_ACTIVE_MODEL_NAME in the claude child's env; inject
+#     it, or the restored pane silently comes back on the default model.
+# Any pre-existing --resume is stripped; post_restore re-adds exactly one
+# authoritative --resume. Printed on one line with tabs/newlines removed, so the
+# result is safe as a single snapshot field. Args: <launcher_argv> <claude_pid>
+_cc_claudish_replay() {
+  local launcher_argv="$1" claude_pid="$2" flags model
+  flags="${launcher_argv##*/claudish}"     # drop the 'node /…/claudish' prefix
+  # Strip EVERY --resume, with or without its uuid, then collapse and trim. The
+  # bare mid-string case is load-bearing: a session restored by an older
+  # continuity carries a doubled `--resume --resume <uuid>`, and a dangling bare
+  # --resume would make the replay swallow the following flag as its value.
+  flags="$(printf '%s' "$flags" | sed -E 's/--resume( +[0-9a-fA-F-]{36})?//g; s/  +/ /g; s/^ +//; s/ +$//')"
+  case " $flags " in
+    *" --model "*|*" -m "*|*" --model-opus "*|*" --model-sonnet "*|*" --model-haiku "*|*" --model-subagent "*|*" --profile "*)
+      : ;;  # explicit model or profile → replay as-is
+    *)
+      model="$(ps eww -p "$claude_pid" 2>/dev/null | tr ' ' '\n' \
+        | sed -n 's/^CLAUDISH_ACTIVE_MODEL_NAME=//p' | head -1)"
+      [ -n "$model" ] && flags="${flags:+$flags }--model $model" ;;
+  esac
+  printf '%s' "$flags" | tr -d '\t\n'
+}
+
+while IFS=$'\t' read -r pane_target pane_id sid claude_pid claudish_pid; do
   [ -n "$pane_target" ] && [ -n "$sid" ] || continue
 
   # The command as the user actually TYPED it, recorded by the preexec hook in
@@ -249,7 +292,18 @@ while IFS=$'\t' read -r pane_target pane_id sid; do
     launch_b64="$(base64 < "${launch_dir}/${pane_id#%}" 2>/dev/null | tr -d '\n')"
   fi
 
-  printf '%s\t%s\t%s\n' "$pane_target" "$sid" "$launch_b64"
+  # A claudish pane needs its provider/proxy reconstructed, not just its
+  # transcript: relaunching it as a bare `claude --resume` would replay the
+  # session against the REAL Anthropic API — wrong account, wrong model. The awk
+  # climb already identified the launcher on the path from this session's process
+  # up to its pane, so no second process walk is needed here.
+  replay=""
+  if [ -n "$claudish_pid" ]; then
+    launcher_argv="$(ps -o command= -p "$claudish_pid" 2>/dev/null)"
+    [ -n "$launcher_argv" ] && replay="$(_cc_claudish_replay "$launcher_argv" "$claude_pid")"
+  fi
+
+  printf '%s\t%s\t%s\t%s\n' "$pane_target" "$sid" "$launch_b64" "$replay"
 done < "$registry_file" > "$declare_map_file"
 
 # ── Enrich the snapshot ──────────────────────────────────────────────────────
@@ -270,13 +324,19 @@ $rest
 EOF
   pane_target="${r_sess}:${r_win}.${r_pane}"
 
-  matched_sid="$(awk -F'\t' -v t="$pane_target" '$1 == t {print $2; exit}' "$declare_map_file")"
-  matched_cmd="$(awk -F'\t' -v t="$pane_target" '$1 == t {print $3; exit}' "$declare_map_file")"
+  # One awk pass per row, three fields out, so a pane's row is enriched with
+  # whichever of them apply. A claudish pane carries BOTH a SID (so the boot
+  # verdict counts it and post_restore has its resume token) AND the replay flags
+  # (so post_restore relaunches `claudish <flags> --resume <sid>`).
+  IFS=$'\t' read -r matched_sid matched_cmd matched_replay <<EOF
+$(awk -F'\t' -v t="$pane_target" '$1 == t {print $2 "\t" $3 "\t" $4; exit}' "$declare_map_file")
+EOF
 
-  if [ -n "$matched_sid" ] && [ -n "$matched_cmd" ]; then
-    printf '%s\t%s\t;CLAUDE_SID=%s\t;CLAUDE_CMD=%s\n' "$line_type" "$rest" "$matched_sid" "$matched_cmd"
-  elif [ -n "$matched_sid" ]; then
-    printf '%s\t%s\t;CLAUDE_SID=%s\n' "$line_type" "$rest" "$matched_sid"
+  if [ -n "$matched_sid" ]; then
+    _row="${line_type}	${rest}	;CLAUDE_SID=${matched_sid}"
+    [ -n "$matched_cmd" ]    && _row="${_row}	;CLAUDE_CMD=${matched_cmd}"
+    [ -n "$matched_replay" ] && _row="${_row}	;CLAUDISH_REPLAY=${matched_replay}"
+    printf '%s\n' "$_row"
   else
     printf '%s\t%s\n' "$line_type" "$rest"
   fi
