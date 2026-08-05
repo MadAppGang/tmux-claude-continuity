@@ -135,16 +135,76 @@ declare_map_file="${SNAPSHOT_FILE}.sidmap.$$"
 # Keep the clobber_guard on EXIT and add temp-file cleanup ahead of it.
 trap 'rm -f "$declare_map_file" "${SNAPSHOT_FILE}.enrich.$$"; clobber_guard' EXIT
 
+# Enumerate ALL descendant PIDs of $1 (breadth-first), PRUNING any subtree rooted
+# at an MCP/headless helper. A Claude pane's tree contains its MCP servers
+# (claudish --mcp, mnemex --mcp, railway mcp, a python mcp-server.py) and those
+# can themselves spawn Claude/claudish children; without pruning we could pick an
+# MCP-spawned session instead of the pane's real foreground one. Depth-capped as a
+# runaway guard. bash 3.2 compatible (string frontier, no arrays).
+_cc_is_mcp() {
+  case " $1 " in
+    *" --mcp"*|*" --mcp "*|*"mcp-server"*|*" mcp "*|*" mcp") return 0 ;;
+  esac
+  return 1
+}
+_cc_descendants() {
+  local frontier="$1" all="" next p kid cmd depth=0
+  while [ -n "${frontier// /}" ] && [ "$depth" -lt 12 ]; do
+    next=""
+    for p in $frontier; do
+      for kid in $(pgrep -P "$p" 2>/dev/null); do
+        cmd="$(ps -o command= -p "$kid" 2>/dev/null)"
+        _cc_is_mcp "$cmd" && continue   # prune this helper AND its subtree
+        all="$all $kid"; next="$next $kid"
+      done
+    done
+    frontier="$next"; depth=$((depth + 1))
+  done
+  printf '%s' "$all"
+}
+
+# Given a claudish LAUNCHER argv, produce the flags to replay after the base
+# `claudish` command, and (for interactive single-model sessions) the resolved
+# --model to inject. Rule mirrors the user's mental model:
+#   * argv already carries --model/--model-<role>/-m/--profile  -> replay verbatim
+#     (an explicit model or a profile's whole role mapping — never collapse it).
+#   * argv carries none of those -> it was an interactive pick of ONE model, which
+#     lives only in CLAUDISH_ACTIVE_MODEL_NAME in the claude child's env; inject it.
+# Any pre-existing --resume is stripped (post_restore re-adds one authoritative
+# --resume). Result is printed on one line, tabs/newlines removed so it is a safe
+# single snapshot field. Args: <launcher_argv> <claude_pid>
+_cc_claudish_replay() {
+  local launcher_argv="$1" claude_pid="$2" flags model
+  flags="${launcher_argv##*/claudish}"     # drop 'node /…/claudish' prefix
+  # Strip EVERY --resume (with or without its uuid), collapse the resulting double
+  # spaces, and trim. This must remove a bare mid-string --resume too: a session
+  # previously restored by an older continuity carries a doubled
+  # `--resume --resume <uuid>`, and leaving the dangling bare --resume would make
+  # the replay swallow the next flag as its value. post_restore re-adds exactly
+  # one authoritative --resume afterwards.
+  flags="$(printf '%s' "$flags" | sed -E 's/--resume( +[0-9a-fA-F-]{36})?//g; s/  +/ /g; s/^ +//; s/ +$//')"
+  case " $flags " in
+    *" --model "*|*" -m "*|*" --model-opus "*|*" --model-sonnet "*|*" --model-haiku "*|*" --model-subagent "*|*" --profile "*)
+      : ;;  # explicit model or profile → replay as-is
+    *)
+      model="$(ps eww -p "$claude_pid" 2>/dev/null | tr ' ' '\n' \
+        | sed -n 's/^CLAUDISH_ACTIVE_MODEL_NAME=//p' | head -1)"
+      [ -n "$model" ] && flags="${flags:+$flags }--model $model" ;;
+  esac
+  printf '%s' "$flags" | tr -d '\t\n'
+}
+
 tmux list-panes -a -F '#S	#I	#P	#{pane_pid}' 2>/dev/null | \
 while IFS=$'\t' read -r sess win pane shell_pid; do
   [ -n "$shell_pid" ] || continue
-  # Candidate PIDs: the pane process itself first (exec'd/resumed Claude), then
-  # its direct children (Claude launched as a child of a non-exec shell).
-  cands="$shell_pid $(pgrep -P "$shell_pid" 2>/dev/null)"
+  # Candidate PIDs: the pane process itself (exec'd/resumed Claude), then its FULL
+  # descendant tree (MCP-pruned). The full walk — not just direct children — is
+  # what lets us find Claude at depth 3 under `zsh → node claudish → bun → claude`.
+  cands="$shell_pid $(_cc_descendants "$shell_pid")"
 
   # SOURCE 1 (registry): the by-pid sidecar written by on_session_start.sh.
   # Authoritative when the SessionStart hook fired — also covers FRESH sessions
-  # (a plain `claude` with no --resume flag), which have no SID on the cmdline.
+  # (a plain `claude`, or an interactive claudish, with no --resume on the cmdline).
   sid=""
   for cand in $cands; do
     if [ -f "${by_pid_dir}/${cand}.session-id" ]; then
@@ -154,8 +214,7 @@ while IFS=$'\t' read -r sess win pane shell_pid; do
   done
 
   # SOURCE 2 (cmdline fallback): scrape `--resume <uuid>` from the process args.
-  # Catches RESUMED sessions whose SessionStart hook never registered a sidecar
-  # (hook timing / send-keys relaunch). Independent of the hook firing at all.
+  # Catches RESUMED sessions whose SessionStart hook never registered a sidecar.
   if [ -z "$sid" ]; then
     for cand in $cands; do
       sid="$(ps -o command= -p "$cand" 2>/dev/null \
@@ -164,7 +223,29 @@ while IFS=$'\t' read -r sess win pane shell_pid; do
     done
   fi
 
-  [ -n "$sid" ] && printf '%s:%s.%s\t%s\n' "$sess" "$win" "$pane" "$sid"
+  # Is this a CLAUDISH pane? Find the claudish launcher (node /…/claudish <flags>)
+  # and the claude child among the candidates. The launcher's path ends in
+  # `/claudish` (bin symlink) — NOT the bun `…/claudish/dist/index.js` child, so
+  # `##*/claudish` extracts clean flags. MCP claudish is already pruned above.
+  replay=""
+  if [ -n "$sid" ]; then
+    launcher_argv="" claude_pid=""
+    for cand in $cands; do
+      cmd="$(ps -o command= -p "$cand" 2>/dev/null)"
+      case "$cmd" in
+        */claudish|*/claudish\ *) [ -z "$launcher_argv" ] && launcher_argv="$cmd" ;;
+      esac
+      case "$cmd" in
+        */claude|*/claude\ *) [ -z "$claude_pid" ] && claude_pid="$cand" ;;
+      esac
+    done
+    if [ -n "$launcher_argv" ] && [ -n "$claude_pid" ]; then
+      replay="$(_cc_claudish_replay "$launcher_argv" "$claude_pid")"
+    fi
+  fi
+
+  # sidmap columns: <target> \t <sid> \t <replay>. replay empty = plain claude.
+  [ -n "$sid" ] && printf '%s:%s.%s\t%s\t%s\n' "$sess" "$win" "$pane" "$sid" "$replay"
 done > "$declare_map_file"
 
 # ── Enrich the snapshot ──────────────────────────────────────────────────────
@@ -186,8 +267,16 @@ EOF
   pane_target="${r_sess}:${r_win}.${r_pane}"
 
   matched_sid="$(awk -F'\t' -v t="$pane_target" '$1 == t {print $2; exit}' "$declare_map_file")"
+  matched_replay="$(awk -F'\t' -v t="$pane_target" '$1 == t {print $3; exit}' "$declare_map_file")"
 
-  if [ -n "$matched_sid" ]; then
+  if [ -n "$matched_sid" ] && [ -n "$matched_replay" ]; then
+    # Claudish pane: carry BOTH the SID (so the boot verdict counts it and
+    # post_restore has the resume token) AND the replay flags (so post_restore
+    # relaunches `claudish <flags> --resume <sid>`, never a bare `claude --resume`
+    # which would hit the real Anthropic API instead of the model's provider).
+    printf '%s\t%s\t;CLAUDE_SID=%s\t;CLAUDISH_REPLAY=%s\n' \
+      "$line_type" "$rest" "$matched_sid" "$matched_replay"
+  elif [ -n "$matched_sid" ]; then
     printf '%s\t%s\t;CLAUDE_SID=%s\n' "$line_type" "$rest" "$matched_sid"
   else
     printf '%s\t%s\n' "$line_type" "$rest"

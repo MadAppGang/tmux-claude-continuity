@@ -28,12 +28,24 @@ input="$(cat)"
 
 # ── Skip subagent sessions ────────────────────────────────────────────────────
 
-# Signal 1: agent_type is set → spawned with --agent flag (claudish, subagents)
+# Signal 1: agent_type is set → spawned with --agent flag (Task tool subagents).
 agent_type="$(echo "$input" | jq -r '.agent_type // empty' 2>/dev/null)"
 [ -n "$agent_type" ] && exit 0
 
-# Signal 2: CLAUDISH_ACTIVE_MODEL_NAME is set → running inside claudish proxy
-[ -n "$CLAUDISH_ACTIVE_MODEL_NAME" ] && exit 0
+# Signal 2: headless / print sessions are ephemeral — an MCP create_session, a
+# `-p` one-shot, or a JSON-output run. They never occupy a tmux pane as its
+# foreground program, so they must not claim a pane's resume slot. Detect via the
+# INVOKING claude's own argv ($PPID is the claude that spawned this hook).
+#
+# NOTE: we intentionally do NOT skip on CLAUDISH_ACTIVE_MODEL_NAME. That env var
+# is set on EVERY claude claudish spawns — including the MAIN interactive pane
+# session — so skipping on it dropped the user's real claudish panes from restore
+# entirely. The main claudish session runs claude interactively (no -p) and IS a
+# restorable pane; only the ephemeral shapes above should be skipped.
+_cc_claude_args="$(ps -o command= -p "$PPID" 2>/dev/null)"
+case " $_cc_claude_args " in
+  *" -p "*|*" --print "*|*" --output-format "*) exit 0 ;;
+esac
 
 # ── Capture session ID ────────────────────────────────────────────────────────
 
