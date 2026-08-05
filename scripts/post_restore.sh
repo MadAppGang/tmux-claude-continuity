@@ -556,6 +556,65 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
 
 done < "$RESURRECT_FILE"
 
+# ── Heal panes scarred by the old empty-title column shift ───────────────────
+# tmux-resurrect writes pane_title (col 7) with NO ':' sentinel, unlike
+# pane_current_path (col 8). A pane with an EMPTY title therefore collapsed its
+# row: every later column shifted left, restore applied the ':'-prefixed PATH as
+# the pane's TITLE, and the directory it read was the pane_active flag ('0'/'1'),
+# so `split-window -c 1` failed and tmux fell back to $HOME.
+#
+# pre_save.sh realigns those rows now (386c602), which stops NEW damage but
+# cannot undo old. A pane corrupted before that fix is left in a state that
+# perpetuates itself: its cwd genuinely IS $HOME and its title genuinely IS
+# ":/the/old/path", so the next save writes a WELL-FORMED row (non-empty title,
+# ':'-prefixed path), the realign correctly finds nothing to repair, and the pane
+# restores to $HOME forever. Only shell panes are affected — a Claude pane always
+# has a title, so its row never collapsed. Measured 2026-08-05: 14 panes sitting
+# in $HOME, 11 of them still carrying their real path in the title.
+#
+# The lost cwd is not lost. It is sitting in the title. Reunite them.
+#
+# Guards, each earning its place:
+#   - shell panes only. A pane running a program never had an empty title, and
+#     must never be sent an Enter (it would submit whatever is half-typed).
+#   - the recorded path must still exist, so a stale title cannot cd anywhere.
+#   - a queued resume always wins the pending slot; healing never displaces it.
+#   - the title is cleared even when the cwd is already correct, otherwise the
+#     next save re-records it and the scar outlives the repair.
+# The cd goes through the pending-file + precmd path, never send-keys: a shell
+# still sourcing .zshrc drops keystrokes (the whole reason that path exists).
+#
+# The whole block is gated on CC_NO_NUDGE. That flag marks "running against the
+# LIVE server for diagnosis" (tests/validate_real.sh), and healing is the one
+# thing in this script that acts on panes the snapshot never mentioned: it would
+# retitle live panes and queue cd's for shells the operator is sitting in. A
+# diagnostic run must observe, not act. tests/heal_lost_cwd.sh covers the
+# behaviour on an isolated server.
+_cc_healed=0
+if [ "${CC_NO_NUDGE:-0}" = "1" ]; then
+  _cc_log "heal: skipped (CC_NO_NUDGE — diagnostic run against a live server)"
+else
+  while IFS=$'\t' read -r _h_id _h_cwd _h_cmd _h_title; do
+    case "$_h_title" in :/*) ;; *) continue ;; esac
+    case "$_h_cmd" in zsh|bash|sh|fish|dash|ksh) ;; *) continue ;; esac
+    _h_want="${_h_title#:}"
+    [ -d "$_h_want" ] || continue
+
+    $TMUX_CMD select-pane -t "$_h_id" -T '' 2>/dev/null
+
+    [ "$_h_cwd" = "$HOME" ] || continue
+    _h_pf="${pending_dir}/${_h_id#%}"
+    [ -e "$_h_pf" ] && continue
+
+    printf 'cd %q\n' "$_h_want" > "$_h_pf" 2>/dev/null || continue
+    $TMUX_CMD send-keys -t "$_h_id" "" Enter 2>/dev/null
+    _cc_healed=$((_cc_healed + 1))
+    _cc_log "HEAL $_h_id: cwd was \$HOME, title carried '$_h_want' — queued cd, cleared title"
+  done < <($TMUX_CMD list-panes -a -F '#{pane_id}	#{pane_current_path}	#{pane_current_command}	#{pane_title}' 2>/dev/null)
+  [ "$_cc_healed" -gt 0 ] && \
+    _cc_log "healed $_cc_healed pane(s) whose cwd was lost to the empty-title column shift"
+fi
+
 # ── Boot verdict ─────────────────────────────────────────────────────────────
 # Self-certify the restore so a real reboot reports pass/fail instead of leaving
 # you to discover bare panes by eye.
