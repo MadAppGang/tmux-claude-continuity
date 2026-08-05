@@ -40,8 +40,21 @@ agent_type="$(echo "$input" | jq -r '.agent_type // empty' 2>/dev/null)"
 session_id="$(echo "$input" | jq -r '.session_id // empty' 2>/dev/null)"
 [ -n "$session_id" ] || exit 0
 
-pane_key="$(tmux display-message -t "${TMUX_PANE:-}" -p '#S-#I-#P' 2>/dev/null)"
-[ -n "$pane_key" ] || exit 0
+# TMUX_PANE gates the POSITION-keyed write only — never the PID-keyed one below,
+# which is what the snapshot enrichment actually reads.
+#
+# `display-message -t ""` does NOT fail: tmux treats an empty target as "the
+# active pane of the current client". So a Claude session running OUTSIDE tmux
+# (a plain iTerm/Terminal shell) resolves a pane key anyway and overwrites the
+# record of whatever pane the user happens to be looking at. Observed: a
+# non-tmux session in ~/dotfiles claimed the key `claudish-3-1`, which belonged
+# to a live worktree pane in a different project. post_restore.sh no longer
+# reads these files (see the note there), so the blast radius is diagnostics —
+# but wrong data is worse than no data when you are debugging a restore.
+pane_key=""
+if [ -n "${TMUX_PANE:-}" ]; then
+  pane_key="$(tmux display-message -t "$TMUX_PANE" -p '#S-#I-#P' 2>/dev/null)"
+fi
 
 panes_dir="$(tmux show-option -gqv @claude-continuity-panes-dir 2>/dev/null)"
 panes_dir="${panes_dir:-$HOME/.config/tmux-claude/panes}"
@@ -61,10 +74,12 @@ fi
 
 # Line 1: always the UUID (used by post_restore.sh for --resume)
 # Line 2: custom title if set (used for display/diagnostics only)
-if [ -n "$custom_title" ]; then
-  printf '%s\n%s\n' "$session_id" "$custom_title" > "${panes_dir}/${pane_key}.session-id"
-else
-  echo "$session_id" > "${panes_dir}/${pane_key}.session-id"
+if [ -n "$pane_key" ]; then
+  if [ -n "$custom_title" ]; then
+    printf '%s\n%s\n' "$session_id" "$custom_title" > "${panes_dir}/${pane_key}.session-id"
+  else
+    echo "$session_id" > "${panes_dir}/${pane_key}.session-id"
+  fi
 fi
 
 # ── PID-keyed sidecar ─────────────────────────────────────────────────────────

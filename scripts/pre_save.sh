@@ -117,55 +117,127 @@ done
 # For each tmux pane, find the Claude process and look it up in the by-pid
 # sidecar dir. Output: one line per pane with format "<S>:<W>.<P> <session_id>".
 #
-# The Claude process can be the pane process in TWO shapes, and we MUST check
-# both or enrichment silently misses sessions:
-#   1. pane_pid ITSELF — Claude is the pane's process directly. Happens when the
-#      pane was started with `exec claude` (some launchers / older resume path),
-#      so Claude replaced the shell and inherited its PID.
-#   2. a CHILD of pane_pid — Claude launched as a child of an interactive shell
-#      that did NOT exec. This is the common case: typing `claude` at a normal
-#      prompt, AND the first-prompt resume path (which deliberately runs claude
-#      as a child so quitting it returns to interactive zsh — see
-#      claude-continuity.zsh).
-# Checking pane_pid first, then children, covers both. (The original code only
-# checked children — fine for child-launched Claude, but it missed any exec'd
-# pane-process Claude, so those snapshots saved no CLAUDE_SID and broke the next
-# restore.)
+# We do NOT enumerate candidate PIDs downward from the pane (pane_pid + its
+# direct children). That was the old approach and it silently found NOTHING on
+# a machine where Claude is launched through a wrapper: the common alias
+#
+#     c → op run --environment … -- claude --dangerously-skip-permissions
+#
+# puts 1Password's `op` between the shell and Claude, so the process tree is
+#     zsh (pane_pid) → op run → claude
+# and Claude is a GRANDchild. A depth-1 search misses it, SOURCE 1 never
+# matches, and the only surviving source is the cmdline scrape below — which
+# fires only for sessions that ALREADY carry `--resume <uuid>`. Net effect:
+# every FRESH session (typed `c`, or `c --worktree foo`) was saved with no
+# CLAUDE_SID and came back from restore as a brand-new empty session. Measured
+# on a real snapshot: 0 of 46 panes matched via SOURCE 1, and all 19 panes with
+# no `--resume` on their cmdline lost their session permanently.
+#
+# So climb UPWARD instead: start at each registered PID and walk the parent
+# chain until we land on a pane_pid. This is depth-agnostic (op, direnv, mise,
+# a login shell, any future wrapper), and it is cheaper — the whole join is one
+# `ps` snapshot and one awk pass instead of two `pgrep` forks per pane.
+#
+# Ties are broken by DEPTH: the shallowest process that climbs to a given pane
+# wins. That keeps a nested Claude (one spawned by an agent's Bash tool, several
+# levels down) from shadowing the pane's own session.
 declare_map_file="${SNAPSHOT_FILE}.sidmap.$$"
+panes_file="${SNAPSHOT_FILE}.panes.$$"
+ps_file="${SNAPSHOT_FILE}.ps.$$"
+registry_file="${SNAPSHOT_FILE}.registry.$$"
 # Keep the clobber_guard on EXIT and add temp-file cleanup ahead of it.
-trap 'rm -f "$declare_map_file" "${SNAPSHOT_FILE}.enrich.$$"; clobber_guard' EXIT
+trap 'rm -f "$declare_map_file" "$panes_file" "$ps_file" "$registry_file" "${SNAPSHOT_FILE}.enrich.$$"; clobber_guard' EXIT
 
 launch_dir="$(tmux show-option -gqv @claude-continuity-launch-dir 2>/dev/null)"
 launch_dir="${launch_dir:-$HOME/.config/tmux-claude/launch}"
 
-tmux list-panes -a -F '#S	#I	#P	#{pane_pid}	#{pane_id}' 2>/dev/null | \
-while IFS=$'\t' read -r sess win pane shell_pid pane_id; do
-  [ -n "$shell_pid" ] || continue
-  # Candidate PIDs: the pane process itself first (exec'd/resumed Claude), then
-  # its direct children (Claude launched as a child of a non-exec shell).
-  cands="$shell_pid $(pgrep -P "$shell_pid" 2>/dev/null)"
+tmux list-panes -a -F '#{pane_pid}	#S:#I.#P	#{pane_id}' 2>/dev/null > "$panes_file"
+[ -s "$panes_file" ] || exit 0
+ps -axo pid=,ppid=,command= 2>/dev/null > "$ps_file"
 
-  # SOURCE 1 (registry): the by-pid sidecar written by on_session_start.sh.
-  # Authoritative when the SessionStart hook fired — also covers FRESH sessions
-  # (a plain `claude` with no --resume flag), which have no SID on the cmdline.
-  sid=""
-  for cand in $cands; do
-    if [ -f "${by_pid_dir}/${cand}.session-id" ]; then
-      sid="$(head -1 "${by_pid_dir}/${cand}.session-id")"
-      [ -n "$sid" ] && break
-    fi
-  done
+# One awk pass over three inputs: the pane table, the process table, and every
+# by-pid sidecar. Files are told apart by name, so this stays portable (macOS
+# awk has no ARGIND) and costs a single fork.
+set -- "${by_pid_dir}"/*.session-id
+[ -f "$1" ] || set --
+awk -v panes="$panes_file" -v pstab="$ps_file" '
+  # ── pane table: pane_pid → "S:W.P" and pane id ──
+  FILENAME == panes {
+    n = split($0, f, "\t")
+    if (n >= 2 && f[1] != "") { target[f[1]] = f[2]; paneid[f[1]] = f[3] }
+    next
+  }
 
-  # SOURCE 2 (cmdline fallback): scrape `--resume <uuid>` from the process args.
-  # Catches RESUMED sessions whose SessionStart hook never registered a sidecar
-  # (hook timing / send-keys relaunch). Independent of the hook firing at all.
-  if [ -z "$sid" ]; then
-    for cand in $cands; do
-      sid="$(ps -o command= -p "$cand" 2>/dev/null \
-        | grep -oE 'resume [0-9a-fA-F-]{36}' | awk '{print $2; exit}')"
-      [ -n "$sid" ] && break
-    done
-  fi
+  # ── process table: child → parent, plus argv for the cmdline fallback ──
+  FILENAME == pstab {
+    if ($1 == "" || $2 == "") next
+    parent[$1] = $2
+    # SOURCE 2 (cmdline fallback): scrape `--resume <uuid>` from the args.
+    # Catches RESUMED sessions whose SessionStart hook never registered a
+    # sidecar (hook timing / send-keys relaunch). Independent of the hook
+    # firing at all. Recorded here, applied in END only where SOURCE 1 is
+    # silent, preserving the original registry-wins precedence.
+    for (i = 3; i < NF; i++) {
+      w = $i
+      sub(/=.*$/, "", w)
+      if (w == "--resume" || w == "-r" || w == "--session-id") {
+        u = $(i + 1)
+        sub(/^.*=/, "", u)
+        if (length(u) == 36 && u ~ /^[0-9a-fA-F-]+$/) { scraped[$1] = u; break }
+      }
+    }
+    next
+  }
+
+  # ── by-pid sidecars: line 1 is the session UUID (line 2, if any, is a title) ──
+  FNR == 1 {
+    n = split(FILENAME, p, "/")
+    pid = p[n]; sub(/\.session-id$/, "", pid)
+    if (pid ~ /^[0-9]+$/ && $0 != "") registered[pid] = $0
+    next
+  }
+
+  # Climb from pid to the pane that owns it. Returns "" if it never reaches one
+  # (a detached process, or one belonging to a pane that has since closed).
+  function owner(pid,   cur, i) {
+    cur = pid
+    for (i = 0; i < 24; i++) {
+      if (cur in target) return cur
+      if (!(cur in parent)) return ""
+      if (parent[cur] == cur || parent[cur] == "0" || parent[cur] == "1") return ""
+      cur = parent[cur]
+    }
+    return ""
+  }
+  function depth(pid,   cur, i) {
+    cur = pid
+    for (i = 0; i < 24; i++) {
+      if (cur in target) return i
+      if (!(cur in parent)) return -1
+      cur = parent[cur]
+    }
+    return -1
+  }
+  function claim(pid, sid,   o, d) {
+    o = owner(pid); if (o == "") return
+    d = depth(pid)
+    if (o in best && bestdepth[o] <= d) return
+    best[o] = sid; bestdepth[o] = d
+  }
+
+  END {
+    # SOURCE 1 (registry): the by-pid sidecar written by on_session_start.sh.
+    # Authoritative when the SessionStart hook fired — also covers FRESH
+    # sessions (a plain `claude` with no --resume flag), which have no SID on
+    # the cmdline and are invisible to SOURCE 2.
+    for (pid in registered) claim(pid, registered[pid])
+    for (pid in scraped) if (!(owner(pid) in best)) claim(pid, scraped[pid])
+    for (pp in best) print target[pp] "\t" paneid[pp] "\t" best[pp]
+  }
+' "$panes_file" "$ps_file" "$@" > "$registry_file"
+
+while IFS=$'\t' read -r pane_target pane_id sid; do
+  [ -n "$pane_target" ] && [ -n "$sid" ] || continue
 
   # The command as the user actually TYPED it, recorded by the preexec hook in
   # claude-continuity.zsh (see there for why ps cannot supply this). Base64 so an
@@ -173,12 +245,12 @@ while IFS=$'\t' read -r sess win pane shell_pid pane_id; do
   # tab-separated line format. `base64` with no wrapping: -w0 is GNU, macOS
   # doesn't accept it and doesn't wrap by default, so strip newlines instead.
   launch_b64=""
-  if [ -n "$sid" ] && [ -n "$pane_id" ] && [ -f "${launch_dir}/${pane_id#%}" ]; then
+  if [ -n "$pane_id" ] && [ -f "${launch_dir}/${pane_id#%}" ]; then
     launch_b64="$(base64 < "${launch_dir}/${pane_id#%}" 2>/dev/null | tr -d '\n')"
   fi
 
-  [ -n "$sid" ] && printf '%s:%s.%s\t%s\t%s\n' "$sess" "$win" "$pane" "$sid" "$launch_b64"
-done > "$declare_map_file"
+  printf '%s\t%s\t%s\n' "$pane_target" "$sid" "$launch_b64"
+done < "$registry_file" > "$declare_map_file"
 
 # ── Enrich the snapshot ──────────────────────────────────────────────────────
 tmp="${SNAPSHOT_FILE}.enrich.$$"
