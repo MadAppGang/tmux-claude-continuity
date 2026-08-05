@@ -36,7 +36,7 @@ fail=0
 
 _tmux() { tmux -L "$SOCKET" -f /dev/null "$@"; }
 _teardown() { tmux -L "$SOCKET" kill-server 2>/dev/null; rm -rf "$TD"; }
-trap _teardown EXIT
+trap _teardown EXIT INT TERM
 
 mkdir -p "$QD" "$RD" "$WANT"
 

@@ -42,7 +42,7 @@ _teardown() {
   tmux -L "$SOCKET" kill-server 2>/dev/null
   rm -rf "$TD"
 }
-trap _teardown EXIT
+trap _teardown EXIT INT TERM
 
 mkdir -p "$PD/by-pid" "$LD" "$BIN"
 
@@ -157,8 +157,60 @@ assert_eq "typed command embedded and decodes verbatim" \
 assert_eq "SID still embedded alongside it" "$(sid_in_snapshot)" "$SID_GRAND"
 rm -f "$LD/${PANE_ID#%}"
 
+# ── 4c. One session id must never be recorded for two panes ──────────────────
+# An old restore could route one snapshot row into two panes, leaving both
+# running `claude --resume <same uuid>`. Both then register that id, both rows
+# carry it, and the next restore recreates the pair — while two Claude instances
+# append to a single transcript. The save must keep exactly one, stably.
+echo "[4c] ONE SESSION, ONE PANE: a duplicate id is dropped from the extra pane"
+rm -f "$PD/by-pid/"*.session-id
+SECOND="$(_tmux split-window -t work -d -P -F '#{pane_id}' "sh -c 'sh -c \"sleep 600; :\"; :'")"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  SEC_PID="$(_tmux display-message -p -t "$SECOND" '#{pane_pid}')"
+  SEC_CHILD="$(pgrep -P "${SEC_PID:-0}" 2>/dev/null | head -1)"
+  [ -n "$SEC_CHILD" ] && break
+  sleep 0.3
+done
+if [ -n "$SEC_CHILD" ]; then ok "second pane's process resolved ($SECOND -> $SEC_CHILD)"
+else bad "second pane's process resolved" "SEC_PID=$SEC_PID SEC_CHILD=empty — the duplicate would never exist"; fi
+SID_DUP="55555555-5555-4555-8555-555555555555"
+echo "$SID_DUP" > "$PD/by-pid/$GRANDCHILD.session-id"
+echo "$SID_DUP" > "$PD/by-pid/$SEC_CHILD.session-id"
+
+COORDS2="$(_tmux list-panes -a -F '#S	#I	#P	#{pane_id}' | grep "	${SECOND}$" | head -1)"
+S2="$(printf '%s' "$COORDS2" | cut -f1)"; W2="$(printf '%s' "$COORDS2" | cut -f2)"
+P2="$(printf '%s' "$COORDS2" | cut -f3)"
+{ printf 'pane\t%s\t%s\t1\t:*\t%s\t\xe2\x9c\xb3 Claude Code\t:%s\t1\tsh\t:sh\n' "$SESS" "$WIN" "$PIDX" "$TD"
+  printf 'pane\t%s\t%s\t1\t:*\t%s\t\xe2\x9c\xb3 Claude Code\t:%s\t1\tsh\t:sh\n' "$S2" "$W2" "$P2" "$TD"
+} > "$SNAP"
+CC_SAVE_LOG="$TD/save.log" PATH="$BIN:$PATH" bash "$PRE_SAVE" "$SNAP"
+assert_eq "the id is recorded exactly once across both panes" \
+  "$(grep -o ";CLAUDE_SID=$SID_DUP" "$SNAP" | wc -l | tr -d ' ')" "1"
+
+# The drop must be visible. Afterwards the row simply looks like a pane that was
+# never Claude, so without a log line there is nothing to explain the missing
+# session to whoever goes looking for it.
+if grep -q "DUP-SESSION" "$TD/save.log" 2>/dev/null; then
+  ok "the dropped pane is logged"
+else
+  bad "the dropped pane is logged" "no DUP-SESSION line in $TD/save.log"
+fi
+
+# Stability matters as much as uniqueness: if the winner flipped between saves the
+# pair would ping-pong, each restore handing the session to the other pane.
+FIRST_WINNER="$(awk -F'\t' '$1=="pane"{for(i=1;i<=NF;i++) if($i ~ /^;CLAUDE_SID=/) print $2":"$3"."$6}' "$SNAP")"
+CC_SAVE_LOG="$TD/save.log" PATH="$BIN:$PATH" bash "$PRE_SAVE" "$SNAP"
+assert_eq "same pane keeps it on a second save (no ping-pong)" \
+  "$(awk -F'\t' '$1=="pane"{for(i=1;i<=NF;i++) if($i ~ /^;CLAUDE_SID=/) print $2":"$3"."$6}' "$SNAP")" \
+  "$FIRST_WINNER"
+assert_eq "no non-uuid token was embedded (the ;DUP= marker never leaks)" \
+  "$(grep -o ';CLAUDE_SID=[^\t]*' "$SNAP" | grep -cv ';CLAUDE_SID=[0-9a-f-]\{36\}$' | tr -d ' ')" "0"
+_tmux kill-pane -t "$SECOND" 2>/dev/null
+rm -f "$PD/by-pid/"*.session-id
+
 # ── 5. A process belonging to no pane must never be attributed ───────────────
 echo "[5] NO FALSE ATTRIBUTION: an unrelated process claims nothing"
+write_snapshot
 rm -f "$PD/by-pid/"*.session-id
 echo "44444444-4444-4444-8444-444444444444" > "$PD/by-pid/$$.session-id"
 write_snapshot

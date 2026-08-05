@@ -146,10 +146,19 @@ panes_file="${SNAPSHOT_FILE}.panes.$$"
 ps_file="${SNAPSHOT_FILE}.ps.$$"
 registry_file="${SNAPSHOT_FILE}.registry.$$"
 # Keep the clobber_guard on EXIT and add temp-file cleanup ahead of it.
-trap 'rm -f "$declare_map_file" "$panes_file" "$ps_file" "$registry_file" "${SNAPSHOT_FILE}.enrich.$$"; clobber_guard' EXIT
+trap 'rm -f "$declare_map_file" "$panes_file" "$ps_file" "$registry_file" "${SNAPSHOT_FILE}.enrich.$$" "${SNAPSHOT_FILE}.strip.$$"; clobber_guard' EXIT
 
 launch_dir="$(tmux show-option -gqv @claude-continuity-launch-dir 2>/dev/null)"
 launch_dir="${launch_dir:-$HOME/.config/tmux-claude/launch}"
+
+# Shared with post_restore.sh so a boot's save-side and restore-side notes land
+# in one file — the thing you `tail` after a reboot. CC_SAVE_LOG overrides it for
+# tests, which must not append to the user's real log.
+if [ -z "${CC_SAVE_LOG:-}" ]; then
+  CC_SAVE_LOG="$(tmux show-option -gqv @claude-continuity-log-file 2>/dev/null)"
+  CC_SAVE_LOG="${CC_SAVE_LOG:-$HOME/.tmux/scripts/claude-continuity-restore.log}"
+fi
+_CC_SAVE_LOG="$CC_SAVE_LOG"
 
 tmux list-panes -a -F '#{pane_pid}	#S:#I.#P	#{pane_id}' 2>/dev/null > "$panes_file"
 [ -s "$panes_file" ] || exit 0
@@ -243,9 +252,44 @@ awk -v panes="$panes_file" -v pstab="$ps_file" '
     # on the cmdline), which are invisible to SOURCE 2.
     for (pid in registered) claim(pid, registered[pid])
     for (pid in scraped) if (!(owned(pid) in best)) claim(pid, scraped[pid])
-    # <target> <pane id> <sid> <winning pid> <claudish launcher pid, or empty>
-    for (pp in best)
+
+    # ── One session, one pane ────────────────────────────────────────────────
+    # Two panes can genuinely hold the SAME session id: an old restore routed one
+    # snapshot row into two panes (the dedup bug fixed in ed33bc1), and both
+    # relaunched `claude --resume <same uuid>`. The code bug is gone, but the
+    # STATE it created re-records itself on every save — both panes report the id,
+    # both rows carry it, and the next restore recreates the pair. Proven live:
+    # janus:1.1+2.1 and timeroo:1.1+1.2, each pair sharing one transcript file.
+    #
+    # Two Claude instances appending to one transcript is worse than a cosmetic
+    # duplicate, so break the loop here: exactly one pane keeps the id, the others
+    # are recorded with none and come back as fresh sessions. Selection is by
+    # sorted pane target — arbitrary but STABLE, so the same pane keeps it across
+    # saves instead of the pair ping-ponging. Dropped panes are printed with an
+    # empty sid so the shell can log them.
+    n = 0
+    for (pp in best) ord[++n] = pp
+    for (i = 1; i < n; i++)
+      for (j = i + 1; j <= n; j++)
+        if (target[ord[j]] < target[ord[i]]) { t = ord[i]; ord[i] = ord[j]; ord[j] = t }
+
+    for (i = 1; i <= n; i++) {
+      pp = ord[i]
+      if (best[pp] in sidowner) {
+        # The marker rides in the SID column, never as extra fields sitting
+        # behind empty ones. Tab is an IFS WHITESPACE character, so read
+        # collapses runs of tabs and drops leading ones: a row written with four
+        # tabs then DUP=x is read back with DUP=x in the sid slot, and it then
+        # gets embedded as a session token. That is exactly why every optional
+        # column in the resurrect format carries a colon sentinel instead of
+        # being left empty.
+        print target[pp] "\t" paneid[pp] "\t;DUP=" best[pp] "@" sidowner[best[pp]]
+        continue
+      }
+      sidowner[best[pp]] = target[pp]
+      # <target> <pane id> <sid> <winning pid> <claudish launcher pid, or empty>
       print target[pp] "\t" paneid[pp] "\t" best[pp] "\t" bestpid[pp] "\t" bestclaudish[pp]
+    }
   }
 ' "$panes_file" "$ps_file" "$@" > "$registry_file"
 
@@ -280,6 +324,17 @@ _cc_claudish_replay() {
 }
 
 while IFS=$'\t' read -r pane_target pane_id sid claude_pid claudish_pid; do
+  # A pane whose session id is already owned by another pane. It is recorded with
+  # NO sid, so it restores as a fresh session rather than as a second Claude
+  # attached to someone else's transcript. Logged because it is not self-evident
+  # afterwards: the row just looks like a pane that was never Claude.
+  case "$sid" in
+    ';DUP='*)
+      { mkdir -p "$(dirname "$_CC_SAVE_LOG")" 2>/dev/null && \
+        printf '[%s] DUP-SESSION %s dropped: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+          "$pane_target" "${sid#;DUP=}" >> "$_CC_SAVE_LOG"; } 2>/dev/null || true
+      continue ;;
+  esac
   [ -n "$pane_target" ] && [ -n "$sid" ] || continue
 
   # The command as the user actually TYPED it, recorded by the preexec hook in
@@ -307,6 +362,28 @@ while IFS=$'\t' read -r pane_target pane_id sid claude_pid claudish_pid; do
 done < "$registry_file" > "$declare_map_file"
 
 # ── Enrich the snapshot ──────────────────────────────────────────────────────
+# Strip any sentinels already on the rows first, so enrichment is idempotent.
+# resurrect hands us a fresh dump each save, so normally there are none — but if
+# this ever runs twice over one file, appending a SECOND ;CLAUDE_SID= (and CMD,
+# and REPLAY) pushes the row past the three extra fields post_restore reads, and
+# `read` glues the overflow onto the last slot where no case arm matches it. The
+# sentinels are re-added below from live state, which is the authority anyway.
+stripped="${SNAPSHOT_FILE}.strip.$$"
+if awk -F'\t' 'BEGIN { OFS = "\t" }
+  $1 == "pane" {
+    out = $1
+    for (i = 2; i <= NF; i++)
+      if ($i !~ /^;CLAUDE_SID=/ && $i !~ /^;CLAUDE_CMD=/ && $i !~ /^;CLAUDISH_REPLAY=/)
+        out = out OFS $i
+    print out; next
+  }
+  { print }
+' "$SNAPSHOT_FILE" > "$stripped" && [ -s "$stripped" ]; then
+  mv "$stripped" "$SNAPSHOT_FILE"
+else
+  rm -f "$stripped"
+fi
+
 tmp="${SNAPSHOT_FILE}.enrich.$$"
 
 while IFS=$'\t' read -r line_type rest; do
