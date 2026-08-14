@@ -183,6 +183,113 @@ set -g @claude-continuity-claude-cmd "claude"
 
 ---
 
+## Window freeze / thaw (`prefix + Z`)
+
+A stale window costs the same memory as a live one. Claude and its MCP children
+stay resident in a window you last touched three days ago, competing with the
+work you are actually doing.
+
+**Freeze** a window and the plugin persists everything needed to rebuild it —
+pane cwds, titles, layout, and every Claude session id — kills those process
+trees, and collapses the window to a single read-only *tombstone* pane. The
+window keeps its name, its index and its place in the session. **Thaw** it and
+the panes come back and each Claude resumes by session id, through exactly the
+same mechanism a reboot-restore uses.
+
+A frozen window survives a save/restore **still frozen**: it comes back as a
+tombstone and resumes nothing. That saving is the entire point.
+
+### The sleep manager
+
+`prefix + Z` opens it in a popup:
+
+```
+  AWAKE    magus:5                api-gateway                   4h 12m   ~4.9G   3p   2s
+  AWAKE    circle:1               billing                       2d  3h   ~1.9G   2p   1s
+  FROZEN   aniflow:2              editor                        6d  1h   ~5.2G   3p   2s
+```
+
+| Key | Action |
+|---|---|
+| `Enter` | toggle — freeze an awake window, wake a frozen one |
+| `Ctrl-F` | freeze the selection |
+| `Ctrl-W` | wake (thaw) the selection |
+| `Ctrl-D` | discard a stored entry (typed confirmation) |
+| `Ctrl-P` | pin / unpin — a pinned window is never auto-frozen |
+| `Ctrl-S` | freeze every window of the highlighted session |
+| `Ctrl-A` | freeze every idle candidate (typed confirmation) |
+| `Ctrl-X` | force past a safety rail — one window, typed confirmation |
+| `Ctrl-R` | refresh |
+| `Tab` | multi-select · `?` help · `Esc` quit |
+
+Type to filter, `Tab` to select several. The preview pane shows a frozen
+window's cwd and session ids, or a live window's current screen. Nothing is ever
+acted on without one of those keystrokes.
+
+The manager needs [fzf](https://github.com/junegunn/fzf); without it `prefix + Z`
+prints the same inventory as a read-only table and the CLI below still works.
+
+**Memory figures are approximate.** Summing RSS across a process tree counts
+shared pages once per process, so `~1.5G` means "this window's tree maps about
+that much" — never "freezing returns exactly that much". They are always shown
+with a leading `~`.
+
+### Safety
+
+Freezing kills processes, so every ambiguity resolves to *not* freezing. A
+window is refused if any pane is running something that is not a shell, `claude`
+or `claudish` (vim, a build, `ssh`, `psql` — anything that could lose work), or
+if a live Claude has no attributable session id. That last refusal is not
+overridable by anything, including `Ctrl-X`: freezing would destroy a transcript
+that nothing could resume.
+
+The state file is written, fsynced and re-read from disk, and the process set is
+re-verified pid by pid, **before** the first signal is sent.
+
+### From the command line
+
+```bash
+scripts/cc_freeze.sh freeze work:3      # freeze one window
+scripts/cc_freeze.sh freeze work:       # every window of a session
+scripts/cc_freeze.sh sweep --dry-run    # what auto-freeze would do
+scripts/cc_thaw.sh   thaw   work:3      # wake it
+scripts/cc_popup.sh  --list             # the inventory as TSV
+scripts/doctor.sh                       # section 10 reports the store
+```
+
+### Options
+
+```tmux
+# Root of the frozen-window store.
+# No path component may contain "claude" — those paths appear in a tombstone
+# pane's command line, and the restore path deliberately ignores any command
+# containing "claude" so that an older copy of this plugin cannot re-arm one.
+# Default: ~/.config/tmux-cc/frozen
+set -g @claude-continuity-freeze-dir "$HOME/.config/tmux-cc/frozen"
+
+# Master switch for automatic freezing. Off means the sweep freezes NOTHING,
+# whatever the idle ages. Opt in when you trust it.
+# Default: off
+set -g @claude-continuity-autofreeze "off"
+
+# Idle threshold for the sweep, and for the popup's "idle" counter.
+# Accepts 2d, 36h, 90m, 45s, or bare seconds.
+# Default: 2d
+set -g @claude-continuity-autofreeze-idle "2d"
+```
+
+A fourth option, `@cc-frozen`, is window-local and set by the plugin, never by
+you: it holds the key of the store entry a window currently claims. It is a
+claim token, not an authority — the state file on disk is the record, and an
+entry no live window claims can never act on a window by itself.
+
+Auto-freeze only fires when a window is idle by **both** the persisted activity
+ledger and tmux's own `#{window_activity}`, so the two days after a reboot are
+quiet by construction. It is capped at five windows per sweep. Everything it
+does is logged with a reason and is reversible with `prefix + Z` → `Ctrl-W`.
+
+---
+
 ## Troubleshooting
 
 ### Sessions not resuming after restore

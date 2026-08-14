@@ -32,6 +32,47 @@ _cc_log() {
 }
 _cc_log "post_restore START (pid=$$ tmux='${TMUX_CMD}')"
 
+# ── Shared libraries ─────────────────────────────────────────────────────────
+# _cc_exec_token, _cc_is_claude_launcher, _cc_is_safe_token, the eval-safety
+# predicates and the whole relaunch composition live in lib/ now, so that a
+# reboot restore and a thaw put a pane back through exactly the same code, and
+# so the classifier that answers "is this a Claude launcher" has one home rather
+# than two copies drifting apart. The freeze store comes along the same way.
+#
+# Sourced AFTER _cc_log above: lib/cc_common.sh deliberately does not redefine an
+# _cc_log the sourcing script already has, so this hook's log resolution (and
+# every test that overrides it) is untouched.
+_CC_LIB_DIR="$(cd "$(dirname "$0")/lib" 2>/dev/null && pwd)"
+if [ -n "${_CC_LIB_DIR:-}" ] && [ -f "$_CC_LIB_DIR/cc_store.sh" ]; then
+  # shellcheck source=./lib/cc_store.sh
+  . "$_CC_LIB_DIR/cc_store.sh"
+fi
+if ! type cc_compose_relaunch >/dev/null 2>&1; then
+  # Without the composition there is nothing to write into a pending file, and a
+  # silent no-op here is a screen of bare shells after a reboot. Say so where it
+  # will be seen, on the status line as well as in the log.
+  _cc_log "FATAL: scripts/lib not loadable from ${_CC_LIB_DIR:-$(dirname "$0")/lib} — nothing queued"
+  $TMUX_CMD set-option -g @claude-continuity-boot-warning \
+    "⚠ claude-continuity: scripts/lib is missing — no session was resumed" 2>/dev/null
+  exit 0
+fi
+
+# The namespace directory of the freeze store for THIS tmux socket, resolved
+# WITHOUT creating it (cc_store_ns_dir() mkdirs; this must not). Empty means this
+# server has never frozen a window — a restore hook may not materialise a feature
+# directory on a machine that does not use the feature, and must not write one
+# from a test whose socket predates it.
+_cc_ns_dir_if_exists() {
+  local root ns
+  type _cc_store_root >/dev/null 2>&1 || return 1
+  root="$(_cc_store_root 2>/dev/null)"
+  [ -n "$root" ] && [ -d "$root" ] || return 1
+  ns="$(_cc_socket_ns 2>/dev/null)"
+  [ -n "$ns" ] || return 1
+  [ -d "$root/$ns" ] || return 1
+  printf '%s' "$root/$ns"
+}
+
 # Resolve the snapshot path the SAME way tmux-resurrect does, so we always read
 # the file that was actually restored. An explicit RESURRECT_FILE env wins (used
 # by tests); otherwise honor @resurrect-dir (resurrect's own option), expanding
@@ -140,158 +181,23 @@ _cc_matches_configured_cmd() {
 # than claude, so anything not positively recognized as a Claude launcher falls
 # back to the configured command instead of being executed.
 
-# Resolve which token of a flattened command line is the EXECUTABLE. Classifying
-# by "does the string contain claude anywhere" accepts an ARGUMENT VALUE as proof
-# of a launcher — `node /tmp/mcp-helper.js --provider claude` would qualify, and
-# replaying it runs the helper with --resume instead of Claude.
+# Sourced from lib/cc_proc.sh and lib/cc_relaunch.sh, byte-for-byte the
+# behaviour they had here (49ef9d2), and now shared with freeze/thaw:
 #
-# Executable position, in order:
-#   1. the token after a standalone `--`          (op run … -- claude …)
-#   2. else the first token that is not an interpreter  (node …/claudish …)
-#   3. else the first token
-# Splitting is done under `set -f`: the eval whitelist has no glob characters,
-# but this must not depend on being called after that check.
-_cc_exec_token() {
-  local cmdline="$1" tok exe="" take_next=0
-  set -f
-  set -- $cmdline
-  set +f
-  for tok in "$@"; do
-    if [ "$take_next" = 1 ]; then printf '%s' "$tok"; return 0; fi
-    if [ "$tok" = "--" ]; then take_next=1; continue; fi
-    if [ -z "$exe" ]; then
-      case "${tok##*/}" in
-        node|bun|deno|npx|env|python|python3|ruby|perl|sh|bash|zsh) continue ;;
-      esac
-      exe="$tok"
-    fi
-  done
-  printf '%s' "$exe"
-}
-
-# Everything after the executable — the pane's own arguments, with the launcher
-# token itself removed so they can be appended to a different launcher.
-_cc_args_after_exec() {
-  local cmdline="$1" exe rest
-  exe="$(_cc_exec_token "$cmdline")"
-  rest="${cmdline#*"$exe"}"
-  rest="${rest#"${rest%%[![:space:]]*}"}"   # trim leading whitespace
-  printf '%s' "$rest"
-}
-
-_cc_is_claude_launcher() {
-  # The executable itself must be claude or claudish. This is also what rejects
-  # the MCP children resurrect's ps capture keeps recording in place of claude
-  # (`…/scripts/mcp-server.py`, `mnemex --mcp`, `railway mcp`): their executable
-  # basename is not a Claude binary, so no name heuristic is needed for them.
-  local exe; exe="$(_cc_exec_token "$1")"
-  case "${exe##*/}" in
-    claude|claudish) ;;
-    *) return 1 ;;
-  esac
-
-  # The binaries are dual-purpose, so the executable name is not sufficient:
-  # `claudish --model …` is an interactive session, `claudish --mcp` is an MCP
-  # server that Claude panes run as a CHILD. Reject server mode by exact flag, so
-  # claude's own `--mcp-config <file>` and `--strict-mcp-config` still qualify —
-  # including when the config path is itself named `…/mcp-server.json`.
-  case " $1 " in
-    *' --mcp '*|*' --mcp='*|*' mcp '*) return 1 ;;
-  esac
-
-  # Reject one-shot and free-text-argument forms. A flattened ps capture has lost
-  # its argv boundaries, so a quoted value cannot be reconstructed: `--name "My
-  # Session"` replays as `--name My` plus a stray word, and claudish forwards
-  # stray words as a PROMPT — re-submitting the task on every restore. There is
-  # no way to recover the boundaries from ps output, so these fall back instead.
-  case " $1 " in
-    *' -p '*|*' --print '*|*' --prompt '*|*' --name '*|\
-    *' --system-prompt '*|*' --append-system-prompt '*|*' --output-format '*) return 1 ;;
-  esac
-  return 0
-}
-
-# The pending file is `eval`'d by the pane's shell, so a replayed command must
-# not carry anything the shell would re-interpret. Until now the eval'd string
-# was a fixed configured command plus a UUID; replaying makes it ps-derived, and
-# a ps argv is not guaranteed inert — a prompt passed with -p, a path with a
-# quote, or a stray $ would turn into command substitution, redirection, globbing
-# or chaining at eval time.
-#
-# Whitelist rather than blacklist: allow only the characters real launcher
-# commands actually use (paths, flags, uuids, model ids like cx@gpt-5.6-sol).
-# Anything else falls back to the configured command — a lost wrapper is a
-# cosmetic regression, an eval'd metacharacter is not.
-_cc_is_safe_to_eval() {
-  case "$1" in
-    *[!A-Za-z0-9\ _/.:@=+,%^-]*) return 1 ;;
-  esac
-  return 0
-}
-
-# A token that gets appended to the eval'd command must be inert on its own.
-# The SID is read from a file on disk, so "it is our own UUID" is an assumption,
-# not a guarantee: a snapshot row carrying
-#   ;CLAUDE_SID=00000000-0000-0000-0000-000000000000; /usr/bin/touch /tmp/pwn
-# would otherwise be appended unquoted and the shell would run the second command
-# when Claude exits. Deliberately a charset check, not a strict UUID match, so a
-# future non-UUID session identifier does not silently stop resuming.
-_cc_is_safe_token() {
-  case "$1" in
-    ''|*[!A-Za-z0-9_.-]*) return 1 ;;
-  esac
-  return 0
-}
-
-# Is the launcher the bare claude binary itself, with nothing wrapping it?
-# Position matters, not just identity: `op run … -- claude` also has claude as
-# its executable, but it is a wrapper and must be replayed rather than rebuilt.
-_cc_is_plain_claude() {
-  local exe; exe="$(_cc_exec_token "$1")"
-  case "${exe##*/}" in claude) ;; *) return 1 ;; esac
-  case "$1" in "$exe"*) return 0 ;; esac   # claude is the very first token
-  return 1
-}
-
-# Drop any session-selection flags from a captured command so the authoritative
-# --resume <SID> can be appended without colliding with one already in the
-# command line. The value pattern excludes a leading '-' so a valueless
-# `--resume --foo` cannot swallow the next flag; the sweep afterwards removes
-# whatever bare `--resume` that leaves behind. Both rules are needed — a real
-# snapshot on this machine contains `claudish --resume --resume <uuid> -d`, and
-# with only the first rule that came back out as `claudish --resume -d`, which
-# then took the appended SID's place as the value of the dangling flag.
-# `-r`/`--session-id` values are stripped only when the value is a FULL UUID,
-# since a bare -r in a wrapper is more likely to belong to the wrapper than to
-# claude; a loose `8hex-anything` shape would eat `-r deadbeef-cafe-1234`.
-#
-# It is not enough to drop the SELECTORS — the MODIFIERS have to go too.
-# `--fork-session` survives a naive strip and then turns the appended
-# `--resume <SID>` into "resume that session under a NEW id", i.e. the session is
-# forked instead of continued on every restore. Same for `-c`/`--continue` and
-# `--from-pr`, which each select a different session than the SID does.
-#
-# Applied repeatedly to a fixed point (max 6 passes): a single global pass cannot
-# handle adjacent flags, because after matching `--resume --resume <uuid>` the
-# scanner resumes past the text it consumed, so `--resume --resume --resume UUID`
-# would leave one behind.
-# No \b or [[:<:]] word boundaries — neither is portable across GNU and BSD sed.
-_cc_strip_session_flags() {
-  local uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
-  local cur="$1" prev="" i=0
-  while [ "$cur" != "$prev" ] && [ "$i" -lt 6 ]; do
-    prev="$cur"
-    cur="$(printf '%s' "$cur" | sed -E \
-      -e "s/[[:space:]]+(-r|--resume|--session-id)([[:space:]]+|=)${uuid}//g" \
-      -e 's/[[:space:]]+--resume[[:space:]]+[^[:space:]-][^[:space:]]*//g' \
-      -e 's/[[:space:]]+--resume=[^[:space:]]*//g' \
-      -e 's/[[:space:]]+--from-pr([[:space:]]+[^[:space:]-][^[:space:]]*)?//g' \
-      -e 's/[[:space:]]+(--resume|--continue|-c|--fork-session)([[:space:]])/\2/g' \
-      -e 's/[[:space:]]+(--resume|--continue|-c|--fork-session)[[:space:]]*$//')"
-    i=$((i + 1))
-  done
-  printf '%s' "$cur"
-}
+#   _cc_exec_token         which token of a flattened argv is the EXECUTABLE —
+#                          because "the line contains claude somewhere" accepts
+#                          an ARGUMENT VALUE as proof of a launcher
+#   _cc_is_claude_launcher exec token is claude/claudish, and not --mcp, and not
+#                          a one-shot/free-text form whose argv boundaries a ps
+#                          capture has already destroyed
+#   _cc_is_safe_to_eval    charset whitelist for ps-derived text that a shell
+#                          will eval
+#   _cc_is_safe_token      the same, for the SID appended to it
+#   _cc_is_plain_claude    claude as the FIRST token (a wrapper is replayed, a
+#                          bare claude is rebuilt on the configured launcher)
+#   _cc_args_after_exec    the pane's own arguments, launcher token removed
+#   _cc_strip_session_flags  selectors AND modifiers, to a fixed point
+#   cc_compose_relaunch    the composition below
 
 if [ ! -f "$RESURRECT_FILE" ]; then
   _cc_log "EXIT: resurrect file not found: $RESURRECT_FILE"
@@ -324,6 +230,9 @@ _cc_proc_written=0     # non-Claude programs (@claude-continuity-restore-procs) 
 _cc_skipped_absent=0    # SID rows whose session no longer exists live (benign)
 _cc_skipped_present=0   # SID rows whose session IS live but didn't resolve (real miss)
 _cc_skipped_busy=0      # rows whose pane is already running something (manual restore)
+_cc_frozen_claimed=0    # ❄ tombstone rows re-claimed onto their live window
+_cc_frozen_warn=0       # frozen anomalies that warrant a boot warning, not a failure
+_cc_claimed_keys="|"    # store keys claimed this run, wrapped in | for substring test
 
 # ── Live pane index for content-based resolution ─────────────────────────────
 # The snapshot records each pane's position as session:window.pane, but tmux
@@ -359,17 +268,181 @@ _cc_resolve_by_content() {
   local s="$1" c="$2" t="$3"
   local lp_sess lp_cwd lp_title lp_id
   _CC_RESOLVED=""
+  _CC_RESOLVED_TIER=""
   while IFS=$'\t' read -r lp_sess lp_cwd lp_title lp_id; do
     [ -n "$lp_id" ] || continue
     [ "$lp_sess" = "$s" ] && [ "$lp_cwd" = "$c" ] && [ "$lp_title" = "$t" ] || continue
     case "$_cc_used_ids" in *"|${lp_id}|"*) continue ;; esac  # already claimed
     _cc_used_ids="${_cc_used_ids}${lp_id}|"
     _CC_RESOLVED="$lp_id"
+    _CC_RESOLVED_TIER="exact"
+    return 0
+  done <<EOF
+$_cc_live_panes
+EOF
+
+  # SECOND TIER: (session, title), with the cwd dropped. #{pane_current_path} is
+  # the cwd of the pane's FOREGROUND PROCESS, not of its shell, so during shell
+  # startup it reports whatever a child is doing -- an oh-my-zsh update check
+  # makes every restored pane read as ~/.oh-my-zsh (and momentarily as EMPTY) for
+  # tens of milliseconds. post_restore runs in exactly that window, on panes
+  # resurrect has only just spawned, so the exact tier above can miss for a pane
+  # that is plainly the right one. Falling through to the coordinate fallback
+  # here is the worst possible answer: display-message -t S:W.P resolves a
+  # missing window FUZZILY to a nearby one and never returns empty, so a stale
+  # coordinate misroutes the resume into somebody else's pane. (session, title)
+  # still identifies the pane by content and still consumes the id exactly once,
+  # so duplicate titles stay paired one-to-one instead of collapsing.
+  while IFS=$'\t' read -r lp_sess lp_cwd lp_title lp_id; do
+    [ -n "$lp_id" ] || continue
+    [ "$lp_sess" = "$s" ] && [ "$lp_title" = "$t" ] || continue
+    case "$_cc_used_ids" in *"|${lp_id}|"*) continue ;; esac  # already claimed
+    _cc_used_ids="${_cc_used_ids}${lp_id}|"
+    _CC_RESOLVED="$lp_id"
+    _CC_RESOLVED_TIER="cwd-drift"
     return 0
   done <<EOF
 $_cc_live_panes
 EOF
   return 1
+}
+
+# ── Frozen windows (§3.5 / §4.5) ─────────────────────────────────────────────
+# A frozen window contributes exactly ONE ordinary pane row to the snapshot,
+# whose title is `❄ FROZEN <key> 3p/2s 2026-08-14`. There is no new line type and
+# no new column: the marker rides in a field save.sh already writes and
+# restore.sh already restores verbatim, so a snapshot written by this plugin is
+# an utterly ordinary snapshot to an older one, and vice versa.
+#
+# The key is the second token of the title. It is minted as <epoch>-<6 hex>, so
+# _cc_is_safe_token is a complete validation of it — and it must be validated,
+# because it is used to build a path.
+_cc_frozen_key_of() {
+  local rest="${1#❄ FROZEN }"
+  printf '%s' "${rest%% *}"
+}
+
+# cc_store.sh's rule: an entry whose recorded server_pid is a LIVE pid that is
+# not this server belongs to another tmux server and is untouchable (§2.2).
+# Corroborated against the pid's argv here, because after a reboot the recorded
+# pid is stale and may have been recycled by an unrelated process — and treating
+# our own entry as foreign would leave the window unclaimed on every boot, which
+# is the failure this whole block exists to prevent.
+_cc_frozen_is_foreign() {
+  local sp
+  cc_store_is_foreign "$1" || return 1
+  sp="$(cc_store_scalar "$1" server_pid)"
+  case "$(ps -o command= -p "$sp" 2>/dev/null)" in
+    *tmux*) return 0 ;;
+  esac
+  return 1
+}
+
+# Re-point the two scalars that are only meaningful on the server running NOW.
+# Everything else in the file — the session ids above all — is copied through
+# untouched, and the rewrite goes through the same atomic write the freeze used,
+# so a failure leaves the previous file exactly as it was.
+_cc_frozen_repoint() {
+  local state="$1" srv="$2" wid="$3" tmpf
+  tmpf="$(dirname "$state")/tmp/reclaim.$$"
+  mkdir -p "$(dirname "$tmpf")" 2>/dev/null
+  awk -F'\t' -v sp="$srv" -v wd="$wid" 'BEGIN { OFS = "\t" }
+    $1 == "server_pid" { print $1, sp; next }
+    $1 == "window_id"  { print $1, wd; next }
+    { print }
+  ' "$state" > "$tmpf" 2>/dev/null
+  if [ ! -s "$tmpf" ] || ! _cc_atomic_write "$state" < "$tmpf"; then
+    rm -f "$tmpf"
+    _cc_log "FROZEN-REPOINT-FAILED $state — entry left exactly as it was"
+    return 1
+  fi
+  rm -f "$tmpf"
+  cc_store_verify "$state" || _cc_log "FROZEN-REPOINT-SUSPECT $state: no longer verifies after re-pointing"
+  return 0
+}
+
+# Handle one ❄ row. EVERY branch is non-destructive (§4.5): the worst case is a
+# bare shell wearing a ❄ title, a logged warning and a state file the popup can
+# still thaw. Nothing is killed, respawned, deleted, discarded or re-frozen, and
+# no window other than the one whose own title carries key K is ever touched.
+# Runs in the CURRENT shell (never a subshell) because it mutates _cc_used_ids
+# through _cc_resolve_by_content and the counters the boot verdict reads.
+# Args: session cwd title target
+_cc_frozen_row() {
+  local sess="$1" cwd="$2" title="$3" target="$4"
+  local key ns state pane_id wid banner
+
+  key="$(_cc_frozen_key_of "$title")"
+  if [ -z "$key" ] || ! _cc_is_safe_token "$key"; then
+    _cc_log "FROZEN-UNREADABLE $target: tombstone title carries no usable key ['$title']"
+    _cc_frozen_warn=$((_cc_frozen_warn + 1))
+    return 0
+  fi
+
+  # Resolve by content. The title CARRIES the key, so this is an exact match on a
+  # field that is time-invariant by construction (every component of it is
+  # derived from persisted values, never from "now") — this row is the most
+  # precisely matchable row in the snapshot rather than the least. Consuming the
+  # pane here is also what stops a later row claiming the tombstone.
+  _cc_resolve_by_content "$sess" "$cwd" "$title"
+  pane_id="$_CC_RESOLVED"
+
+  ns="$(_cc_ns_dir_if_exists)"
+  state=""
+  [ -n "$ns" ] && state="$ns/$key.state"
+
+  if [ -z "$pane_id" ]; then
+    _cc_log "FROZEN-UNCLAIMED key=$key ($target): no live pane carries the tombstone title — entry left untouched in the store"
+    _cc_frozen_warn=$((_cc_frozen_warn + 1))
+    return 0
+  fi
+
+  # Fail closed on an unreadable entry (ext #13): it never means "proceed as if
+  # nothing is frozen". An orphan tombstone IS a real miss — the window is asleep
+  # and the record of what it holds is unreadable — so it must not self-certify
+  # green. The pane is left as the shell it already is; doctor offers to clear
+  # the title.
+  if [ -z "$state" ] || ! cc_store_verify "$state"; then
+    _cc_skipped_present=$((_cc_skipped_present + 1))
+    _cc_log "FROZEN-ORPHAN $target -> $pane_id key=$key: no readable state file — REAL MISS"
+    return 0
+  fi
+
+  if _cc_frozen_is_foreign "$state"; then
+    _cc_log "FROZEN-FOREIGN key=$key ($target): held by live server pid $(cc_store_scalar "$state" server_pid) — not claimed"
+    _cc_frozen_warn=$((_cc_frozen_warn + 1))
+    return 0
+  fi
+
+  wid="$($TMUX_CMD display-message -p -t "$pane_id" '#{window_id}' 2>/dev/null)"
+  if [ -z "$wid" ]; then
+    _cc_skipped_present=$((_cc_skipped_present + 1))
+    _cc_log "FROZEN-ORPHAN $target -> $pane_id key=$key: pane belongs to no live window — REAL MISS"
+    return 0
+  fi
+
+  # RE-CLAIM. A state file is inert until a live @window_id on THIS server claims
+  # it; this is the only place that claim is ever re-established after a restart.
+  $TMUX_CMD set-option -w -t "$wid" @cc-frozen "$key" 2>/dev/null
+  _cc_frozen_repoint "$state" "$(_cc_server_pid)" "$wid"
+  # The identity carrier is protected again: the restored pane's own prompt must
+  # not be able to overwrite the title that holds the key.
+  $TMUX_CMD set-option -p -t "$pane_id" allow-rename off 2>/dev/null
+  _cc_claimed_keys="${_cc_claimed_keys}${key}|"
+
+  # Re-render the banner through the pending-file + precmd path, never send-keys
+  # (a shell still sourcing .zshrc drops keystrokes — the whole reason that path
+  # exists). A queued resume would always win the slot; there can be none here,
+  # because this row carries no session id at all.
+  banner="$ns/$key.banner"
+  if [ -f "$banner" ] && [ ! -e "${pending_dir}/${pane_id#%}" ]; then
+    printf 'clear; cat %q\n' "$banner" > "${pending_dir}/${pane_id#%}" 2>/dev/null
+    [ "${CC_NO_NUDGE:-0}" != "1" ] && $TMUX_CMD send-keys -t "$pane_id" "" Enter 2>/dev/null
+  fi
+
+  _cc_frozen_claimed=$((_cc_frozen_claimed + 1))
+  _cc_log "FROZEN-CLAIMED $target -> $pane_id key=$key window=$wid (state re-pointed at this server)"
+  return 0
 }
 
 # Queue a pending resume for each pane that was running claude.
@@ -380,6 +453,19 @@ EOF
 while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
         pane_title dir pane_active pane_cmd pane_full_cmd extra1 extra2 extra3; do
   [ "$line_type" = "pane" ] || continue
+
+  # A frozen window's tombstone row, handled BEFORE pane resolution — not merely
+  # before arming. The generic path's only non-Claude filter is "does the full
+  # command contain the substring claude", and a tombstone's argv can contain it
+  # (any store path or shell path under a directory whose name does). A check
+  # placed later would let this row resolve, CONSUME a live pane id that a real
+  # Claude row may need, and arm a relaunch inside a window that is deliberately
+  # asleep. It is the first act of the loop body for exactly that reason.
+  case "$pane_title" in
+    '❄ FROZEN '*)
+      _cc_frozen_row "$session" "${dir#:}" "$pane_title" "${session}:${win}.${pane_idx}"
+      continue ;;
+  esac
 
   # Strip leading ":" sentinel from full command field
   full_cmd="${pane_full_cmd#:}"
@@ -444,6 +530,7 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   _cc_resolve_by_content "$session" "$snap_dir" "$pane_title"
   pane_id="$_CC_RESOLVED"
   match_kind="content"
+  [ "$_CC_RESOLVED_TIER" = "cwd-drift" ] && _cc_log "CWD-DRIFT $pane_target -> $pane_id: snapshot cwd '$snap_dir' matches no live pane; paired on (session,title) instead of the fuzzy coordinate"
 
   # FALLBACK: only if no content match (e.g. cwd/title changed since save), fall
   # back to the coordinate lookup. NOTE: tmux resolves S:W.P fuzzily, so this can
@@ -495,6 +582,23 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
     case "${pane_now##*/}" in
       sh|bash|zsh|fish|ksh|dash|tcsh|csh|login|'') ;;
       *)
+        # CONFIRM before writing the pane off. #{pane_current_command} is the
+        # pane's FOREGROUND process, and a shell still sourcing its rc files has
+        # children in the foreground -- an oh-my-zsh update check puts git/grep/
+        # sed there for tens of milliseconds. post_restore runs in exactly that
+        # window, on panes resurrect has only just spawned, so a single read
+        # declares a freshly restored shell "busy" and silently drops its resume.
+        # A pane that is genuinely busy (a live Claude session on a manual
+        # prefix + Ctrl-r) is still busy on the second read, so the confirmation
+        # costs nothing in the case the guard exists for. The settle is spent ONCE
+        # per run, not once per pane: a 46-window restore must not pay 46 sleeps.
+        if [ "${_cc_busy_settled:-0}" = "0" ]; then sleep 0.4; _cc_busy_settled=1; fi
+        pane_now="$($TMUX_CMD display-message -p -t "$pane_id" '#{pane_current_command}' 2>/dev/null)"
+        ;;
+    esac
+    case "${pane_now##*/}" in
+      sh|bash|zsh|fish|ksh|dash|tcsh|csh|login|'') ;;
+      *)
         _cc_skipped_busy=$((_cc_skipped_busy + 1))
         _cc_log "SKIP $pane_target -> $pane_id ('$pane_title'): pane already running '$pane_now', not a restored shell — not arming"
         continue ;;
@@ -510,74 +614,35 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
 
   pane_key_file="${pending_dir}/${pane_id#%}"
 
-  # Replay the pane's own launcher when it is a wrapper the configured command
-  # cannot express (claudish, op run -- claude, …); otherwise use the configured
-  # command. See _cc_is_claude_launcher above for why full_cmd is not trusted
-  # unconditionally.
+  # What goes into the pending file is decided ONCE, in cc_compose_relaunch, so a
+  # reboot restore and a thaw put a pane back as exactly the same program: the
+  # user's own typed command when the preexec hook captured one, else the pane's
+  # own launcher replayed when it is a wrapper the configured command cannot
+  # express (claudish, op run -- claude, …), else the configured command carrying
+  # the row's own arguments. It also decides the claudish form, where a bare
+  # `claude --resume` would replay the transcript against the REAL Anthropic API
+  # — wrong account, wrong model.
   #
-  # The replayed command is logged in full. It is the one part of the relaunch
-  # that varies per pane, so when a pane comes back as the wrong program this
-  # line is the difference between reading a log and re-deriving it from ps.
-  relaunch="$base_cmd"
-  relaunch_kind="default"
-
-  # PREFERRED: the command the user actually typed, captured by the preexec hook
-  # at launch time and carried in the snapshot. Nothing is reconstructed here —
-  # the alias is still an alias, the quoting is the user's own — so this is the
-  # only path that is exactly "run it as I ran it". Everything below is fallback
-  # for panes that never passed through a hooked interactive shell.
-  #
-  # It is not passed through _cc_is_safe_to_eval: that whitelist exists to keep
-  # ps-derived text inert, and it rejects the quoting that makes this string
-  # correct. This is the user's own command line, already executed once in this
-  # very shell; re-running it is the entire intent. Only a newline is refused,
-  # since the snapshot is line-oriented and eval of a second line would run a
-  # command the row does not represent.
-  # `-d` is GNU coreutils and modern macOS; `-D` is what older macOS accepts.
-  _cc_typed=""
-  if [ -n "$typed_cmd_b64" ]; then
-    _cc_typed="$(printf '%s' "$typed_cmd_b64" | base64 -d 2>/dev/null | tr -d '\n')"
-    [ -n "$_cc_typed" ] || _cc_typed="$(printf '%s' "$typed_cmd_b64" | base64 -D 2>/dev/null | tr -d '\n')"
-  fi
-  if [ -n "$_cc_typed" ]; then
-    relaunch="$(_cc_strip_session_flags "$_cc_typed")"
-    relaunch_kind="typed:$relaunch"
-  elif [ -n "$full_cmd" ] && _cc_is_claude_launcher "$full_cmd" && _cc_is_safe_to_eval "$full_cmd"; then
-    _cc_stripped="$(_cc_strip_session_flags "$full_cmd")"
-    if _cc_is_plain_claude "$full_cmd"; then
-      # Keep the configured launcher (it carries the env wrapper), add the pane's
-      # own arguments. Empty for the residue rows, which then queue as exactly the
-      # configured command.
-      _cc_args="$(_cc_args_after_exec "$_cc_stripped")"
-      if [ -n "$_cc_args" ]; then
-        relaunch="$base_cmd $_cc_args"
-        relaunch_kind="default+args:$_cc_args"
-      fi
-    else
-      relaunch="$_cc_stripped"
-      relaunch_kind="replay:$relaunch"
-    fi
-  fi
-
-  if [ -n "$claudish_replay" ] && [ -n "$resume_token" ]; then
-    # Claudish pane: relaunch through `claudish` with the saved flags so the model
-    # provider/proxy is reconstructed. A bare `claude --resume` here would resume
-    # the transcript against the REAL Anthropic API instead — wrong account, wrong
-    # model. The replay flags already carry the model (explicit or injected).
-    printf '%s %s --resume %s\n' "$claudish_cmd" "$claudish_replay" "$resume_token" > "$pane_key_file"
-    _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') claudish resume=$resume_token [$claudish_replay]"
-  elif [ -n "$resume_token" ]; then
-    printf '%s --resume %s\n' "$relaunch" "$resume_token" > "$pane_key_file"
-    _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') resume=$resume_token cmd=$relaunch_kind"
-  elif [ -n "$restore_proc_cmd" ]; then
+  # Called with a REDIRECT, never in `$( )`: a command substitution would run it
+  # in a subshell and discard _CC_RELAUNCH_KIND, and that one string is the
+  # difference between reading a log and re-deriving a wrong relaunch from ps.
+  # The trailing newline is written separately for the same reason.
+  if [ -n "$restore_proc_cmd" ]; then
     # Non-Claude program (codex, lazygit, …): relaunch its full saved command
     # through the same pending-file path, so it is subject to no send-keys race.
     printf '%s\n' "$restore_proc_cmd" > "$pane_key_file"
     _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') proc=[$restore_proc_cmd]"
     _cc_proc_written=$((_cc_proc_written + 1))
   else
-    printf '%s\n' "$relaunch" > "$pane_key_file"
-    _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') bare (no token) cmd=$relaunch_kind"
+    { cc_compose_relaunch "$base_cmd" "$claudish_cmd" "$typed_cmd_b64" "$full_cmd" \
+        "$claudish_replay" "$resume_token"; printf '\n'; } > "$pane_key_file"
+    if [ -n "$claudish_replay" ] && [ -n "$resume_token" ]; then
+      _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') claudish resume=$resume_token [$claudish_replay]"
+    elif [ -n "$resume_token" ]; then
+      _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') resume=$resume_token cmd=$_CC_RELAUNCH_KIND"
+    else
+      _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') bare (no token) cmd=$_CC_RELAUNCH_KIND"
+    fi
   fi
   _cc_written=$((_cc_written + 1))
 
@@ -661,6 +726,64 @@ else
     _cc_log "healed $_cc_healed pane(s) whose cwd was lost to the empty-title column shift"
 fi
 
+# ── Frozen intents this snapshot did not carry (§4.5, the third shape) ───────
+# A window frozen AFTER the last save comes back AWAKE: the snapshot has no
+# tombstone row for it, its sessions resume exactly as they would have without
+# this feature, and the store is left holding an entry for a window that is now
+# running. The action is: nothing. Not a refreeze, not a discard, not a thaw —
+# the cost is one freeze that a reboot undid, a resource regression the user
+# re-does with one keystroke, and the entry stays listed and thawable.
+#
+# It is named here because otherwise it is the one shape whose cost is silent.
+# Detection is deliberately narrow: reported only when NO live window claims the
+# key AND a live window matches its recorded (session, window name) and is itself
+# awake. An entry whose window simply did not come back is NOT reported — that is
+# an ordinary frozen window waiting in the popup.
+_cc_ns="$(_cc_ns_dir_if_exists)"
+if [ -n "$_cc_ns" ]; then
+  _cc_live_windows=""
+  for _cc_sf in "$_cc_ns"/*.state; do
+    [ -f "$_cc_sf" ] || continue
+    _cc_k="$(basename "$_cc_sf" .state)"
+    case "$_cc_claimed_keys" in *"|${_cc_k}|"*) continue ;; esac
+    cc_store_verify "$_cc_sf" >/dev/null 2>&1 || continue
+    _cc_frozen_is_foreign "$_cc_sf" && continue
+    [ -n "$_cc_live_windows" ] || _cc_live_windows="$($TMUX_CMD list-windows -a \
+      -F '#{window_id}	#{session_name}	#{window_name}' 2>/dev/null)"
+    _cc_es="$(_cc_unb64 "$(cc_store_scalar "$_cc_sf" session)")"
+    _cc_en="$(_cc_unb64 "$(cc_store_scalar "$_cc_sf" window_name)")"
+    while IFS=$'\t' read -r _cc_wid _cc_ws _cc_wn; do
+      [ -n "$_cc_wid" ] || continue
+      [ "$_cc_ws" = "$_cc_es" ] && [ "$_cc_wn" = "$_cc_en" ] || continue
+      # A window that carries ANY claim is not an undone freeze.
+      [ -n "$($TMUX_CMD show-option -wqv -t "$_cc_wid" @cc-frozen 2>/dev/null)" ] && continue
+      _cc_log "FROZEN-STALE-INTENT key=$_cc_k: ${_cc_es}:${_cc_en} came back awake — the freeze did not survive the restart, entry left in the store"
+      _cc_frozen_warn=$((_cc_frozen_warn + 1))
+      break
+    done <<EOF
+$_cc_live_windows
+EOF
+  done
+fi
+
+# The frozen inventory, reported on its OWN axis and never folded into the
+# resume arithmetic: a frozen window is not a failed resume, and a store entry is
+# not a promise this boot made. Nothing is subtracted from the numerator or the
+# denominator either — a verdict that can subtract rows is a verdict a bad state
+# can talk its way out of.
+_cc_frozen_entries=0
+_cc_frozen_sessions=0
+if [ -n "$_cc_ns" ]; then
+  _cc_frozen_entries="$(ls "$_cc_ns"/*.state 2>/dev/null | grep -c .)"
+  # One sid is one line in a state file, so a line count IS the session count.
+  _cc_frozen_sessions="$(cat "$_cc_ns"/*.state 2>/dev/null | grep -c 'CLAUDE_SID')"
+fi
+case "$_cc_frozen_entries"  in ''|*[!0-9]*) _cc_frozen_entries=0 ;; esac
+case "$_cc_frozen_sessions" in ''|*[!0-9]*) _cc_frozen_sessions=0 ;; esac
+_cc_frozen_clause=""
+[ "$_cc_frozen_entries" -gt 0 ] && \
+  _cc_frozen_clause=", $_cc_frozen_entries frozen window(s) held in the store ($_cc_frozen_sessions session(s), $_cc_frozen_claimed re-claimed this boot)"
+
 # ── Boot verdict ─────────────────────────────────────────────────────────────
 # Self-certify the restore so a real reboot reports pass/fail instead of leaving
 # you to discover bare panes by eye.
@@ -680,20 +803,56 @@ fi
 # is missing fails there — after this script has reported PASS. Certifying
 # "resumed" on the strength of a successful write is how a green verdict and a
 # screen of bare shells coexist.
-_cc_total="$(grep -c 'CLAUDE_SID' "$RESURRECT_FILE" 2>/dev/null)"; _cc_total="${_cc_total:-0}"
+#
+# `total` counts PANE ROWS carrying a sid, anchored to the line type rather than
+# grepping the whole file: only a pane row can ever be armed, so only a pane row
+# belongs in the denominator. A frozen window's row carries no sid at all — its
+# sessions live in the store, not in the photograph — so it is in neither the
+# numerator nor the denominator, and a boot with frozen windows reports on the
+# sessions it actually promised instead of reporting INCOMPLETE forever. The
+# frozen inventory is appended as its own clause above; an ORPHAN tombstone is
+# the one frozen shape that touches this arithmetic, and it does so by counting
+# as a REAL MISS, which is the detector an orphan must not be able to evade.
+_cc_total="$(awk -F'\t' '$1 == "pane" && /CLAUDE_SID/ { n++ } END { print n + 0 }' "$RESURRECT_FILE" 2>/dev/null)"
+case "${_cc_total:-}" in ''|*[!0-9]*) _cc_total=0 ;; esac
 _cc_resumable=$((_cc_total - _cc_skipped_absent - _cc_skipped_busy))
 
 if [ "$_cc_written" -ge "$_cc_resumable" ] && [ "$_cc_skipped_present" -eq 0 ] && [ "$_cc_total" -gt 0 ]; then
-  _cc_log "BOOT VERDICT: PASS — queued $_cc_written/$_cc_resumable resumable session(s) (${_cc_skipped_absent} absent from live layout, ${_cc_skipped_busy} already running, $_cc_total total)"
-  $TMUX_CMD set-option -gu @claude-continuity-boot-warning 2>/dev/null
+  _cc_log "BOOT VERDICT: PASS — queued $_cc_written/$_cc_resumable resumable session(s) (${_cc_skipped_absent} absent from live layout, ${_cc_skipped_busy} already running, $_cc_total total)${_cc_frozen_clause}"
+  if [ "$_cc_frozen_warn" -gt 0 ]; then
+    # Every resume this boot promised was queued, so the verdict is honestly
+    # PASS — but a frozen window that could not be re-claimed is still something
+    # the user must be told about, and clearing the banner here would be the
+    # feature quietly certifying its own regression.
+    $TMUX_CMD set-option -g @claude-continuity-boot-warning \
+      "⚠ claude-continuity: $_cc_frozen_warn frozen window(s) not re-claimed — see $LOG_FILE" 2>/dev/null
+  else
+    $TMUX_CMD set-option -gu @claude-continuity-boot-warning 2>/dev/null
+  fi
 else
-  _cc_log "BOOT VERDICT: INCOMPLETE — queued $_cc_written/$_cc_resumable resumable ($_cc_skipped_present REAL miss, $_cc_skipped_absent absent, $_cc_skipped_busy busy, $_cc_total total)"
+  _cc_log "BOOT VERDICT: INCOMPLETE — queued $_cc_written/$_cc_resumable resumable ($_cc_skipped_present REAL miss, $_cc_skipped_absent absent, $_cc_skipped_busy busy, $_cc_total total)${_cc_frozen_clause}"
   $TMUX_CMD set-option -g @claude-continuity-boot-warning \
     "⚠ claude-continuity: $_cc_written/$_cc_resumable resumed, $_cc_skipped_present lost — see $LOG_FILE" 2>/dev/null
-  { printf '[%s] INCOMPLETE written=%s resumable=%s realmiss=%s absent=%s total=%s snapshot=%s\n' \
+  { printf '[%s] INCOMPLETE written=%s resumable=%s realmiss=%s absent=%s total=%s frozen=%s snapshot=%s\n' \
       "$(date '+%Y-%m-%d %H:%M:%S')" "$_cc_written" "$_cc_resumable" "$_cc_skipped_present" \
-      "$_cc_skipped_absent" "$_cc_total" "$RESURRECT_FILE" \
+      "$_cc_skipped_absent" "$_cc_total" "$_cc_frozen_entries" "$RESURRECT_FILE" \
       >> "${LOG_FILE%.log}-incomplete.log"; } 2>/dev/null || true
 fi
 
-_cc_log "post_restore DONE: wrote $_cc_written pending resume file(s), $_cc_proc_written extra process(es)"
+# ── Ledger seed (§2.5) — the last act ────────────────────────────────────────
+# Baseline the activity ledger at SERVER START, not at the first tick fifteen
+# minutes later: those fifteen minutes are exactly when the user re-engages with
+# the windows they care about, and a tick-time baseline throws every one of those
+# signals away. Carry-over of the previous generation's ;LAST= is by exact
+# (session, window name, ordinal-within-session); a row matching anything other
+# than exactly one live window is dropped, and a dropped row reads as "active as
+# of the seed" — the safe direction, because it can only make a window look
+# busier than it is, never idler.
+#
+# Skipped when this server has no store: seeding would be the act that CREATES
+# one, on a machine that has never frozen a window.
+if [ -n "$_cc_ns" ] && type cc_ledger_seed >/dev/null 2>&1; then
+  cc_ledger_seed
+fi
+
+_cc_log "post_restore DONE: wrote $_cc_written pending resume file(s), $_cc_proc_written extra process(es), re-claimed $_cc_frozen_claimed frozen window(s)"

@@ -12,15 +12,86 @@
 # reachable from the live tmux server, makes the snapshot self-contained
 # and immune to position changes.
 #
-# Format: each enriched pane line gets an additional tab-separated field
-# at the end:  ;CLAUDE_SID=<uuid>
+# Format: an enriched pane line gets additional tab-separated fields at the end,
+# each one SENTINEL-PREFIXED and never empty:
+#     ;CLAUDE_SID=<uuid>   [;CLAUDE_CMD=<b64>]   [;CLAUDISH_REPLAY=<flags>]
+# A value that does not exist is OMITTED, never written as an empty column. TAB
+# is IFS *whitespace*: `read` collapses runs of tabs and strips leading ones, so
+# an empty column vanishes and shifts every later one into the wrong slot. That
+# is landmine L1, and it was live — a claudish pane with no recorded typed
+# command handed its replay flags to the ;CLAUDE_CMD= slot and emitted no
+# ;CLAUDISH_REPLAY= at all, so the pane restored as a bare `claude --resume`:
+# wrong account, wrong model. Every optional value is now read back by its TAG,
+# never by its position.
+#
 # This sentinel-prefixed format is ignored by older post_restore.sh versions
 # (extra trailing data is benign) and parsed by the updated one.
+#
+# The 15-minute save is also the only free heartbeat this plugin has, so the
+# window-freeze store rides it: the activity ledger tick, the thaw-confirmation
+# pass and the autofreeze sweep kick all happen here — and all of them ABOVE the
+# early exits below, which are about SID enrichment and used to skip every one
+# of them.
 
 set -u
 
 SNAPSHOT_FILE="${1:-}"
 [ -n "$SNAPSHOT_FILE" ] && [ -f "$SNAPSHOT_FILE" ] || exit 0
+
+# Every tmux call goes through $TMUX_CMD so this script is drivable against an
+# isolated test socket (`TMUX_CMD="tmux -L sock -f /dev/null"`, landmine L14).
+# Deliberately unquoted at each call site so it word-splits; the default is a
+# bare `tmux`, which is what the existing PATH-shim tests rely on.
+TMUX_CMD="${TMUX_CMD:-tmux}"
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# Shared with post_restore.sh so a boot's save-side and restore-side notes land
+# in one file — the thing you `tail` after a reboot. CC_SAVE_LOG (and CC_LOG_FILE,
+# which the libs read) override it for tests, which must not append to the
+# user's real log. Resolved BEFORE anything can log, and _cc_log is defined here
+# rather than taken from lib/cc_common.sh so every line this run produces —
+# including the ones emitted from inside the libraries — lands in this file.
+CC_SAVE_LOG="${CC_SAVE_LOG:-${CC_LOG_FILE:-}}"
+if [ -z "$CC_SAVE_LOG" ]; then
+  CC_SAVE_LOG="$($TMUX_CMD show-option -gqv @claude-continuity-log-file 2>/dev/null)"
+  CC_SAVE_LOG="${CC_SAVE_LOG:-$HOME/.tmux/scripts/claude-continuity-restore.log}"
+fi
+_CC_SAVE_LOG="$CC_SAVE_LOG"
+CC_LOG_FILE="$_CC_SAVE_LOG"
+
+_cc_log() {
+  # Best-effort: never let logging failure abort a save.
+  { mkdir -p "$(dirname "$_CC_SAVE_LOG")" 2>/dev/null && \
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$_CC_SAVE_LOG"; } 2>/dev/null || true
+}
+
+# ── Shared libraries ─────────────────────────────────────────────────────────
+# The pane→session climb, its ;DUP= branch, the claudish replay reconstruction
+# and the freeze store all live in lib/ now, so this script and cc_freeze.sh can
+# never drift apart on any of them. cc_store.sh pulls in cc_relaunch, cc_proc and
+# cc_common beneath it.
+_CC_LIB_DIR="$(cd "$(dirname "$0")/lib" 2>/dev/null && pwd)"
+if [ -n "$_CC_LIB_DIR" ] && [ -f "$_CC_LIB_DIR/cc_store.sh" ]; then
+  # shellcheck source=./lib/cc_store.sh
+  . "$_CC_LIB_DIR/cc_store.sh"
+fi
+
+# The namespace directory of the freeze store for THIS tmux socket, resolved
+# WITHOUT creating it (cc_store_ns_dir() mkdirs; this must not). Empty means
+# this server has never frozen a window — a save hook may not materialise a
+# feature directory on a machine that does not use the feature, and must not
+# write one from a test whose socket predates it.
+_cc_ns_dir_if_exists() {
+  local root ns
+  type _cc_store_root >/dev/null 2>&1 || return 1
+  root="$(_cc_store_root 2>/dev/null)"
+  [ -n "$root" ] && [ -d "$root" ] || return 1
+  ns="$(_cc_socket_ns 2>/dev/null)"
+  [ -n "$ns" ] || return 1
+  [ -d "$root/$ns" ] || return 1
+  printf '%s' "$root/$ns"
+}
+_CC_STORE_NS="$(_cc_ns_dir_if_exists)"
 
 # ── Clobber guard (runs at script exit, after enrichment) ────────────────────
 # save.sh writes this snapshot to a NEW timestamped file and calls us BEFORE it
@@ -41,6 +112,19 @@ SNAPSHOT_FILE="${1:-}"
 # file, and leaves `last` pointing at the good snapshot. Triggers only on an
 # exact-zero wipe, so legitimate pane closures (never exactly zero while others
 # remain) pass through untouched.
+#
+# THE STORE TERM. A frozen window contributes no ;CLAUDE_SID= to the snapshot —
+# its sessions live in the store, not in the photograph. Freezing every Claude
+# window therefore drives `new` to 0 legitimately, and the two-term guard would
+# then block EVERY save and pin `last` to the pre-freeze snapshot for good: the
+# one mechanism that exists to prevent data loss would become the data loss. The
+# third term reads as "more sessions vanished than the freeze store can account
+# for":
+#     freeze 24 of 24  -> prev=24 new=0 store=24 -> suppressed (correct)
+#     wipe, 2 frozen   -> prev=22 new=0 store=2  -> FIRES     (correct)
+#     wipe, none frozen-> prev=24 new=0 store=0  -> FIRES     (unchanged)
+# Note it is `prev > store`, not `new + store`: the additive form would suppress
+# the middle case, which is a real wipe.
 clobber_guard() {
   local guard_log="$HOME/.tmux/scripts/claude-continuity-clobber-guard.log"
   local last_guard; last_guard="$(dirname "$SNAPSHOT_FILE")/last"
@@ -50,17 +134,89 @@ clobber_guard() {
   case "$(readlink "$last_guard" 2>/dev/null)" in
     "$(basename "$SNAPSHOT_FILE")") return 0 ;;
   esac
-  local prev new
+  local prev new store
   prev="$(grep -c 'CLAUDE_SID' "$last_guard" 2>/dev/null)"; prev="${prev:-0}"
   new="$(grep -c 'CLAUDE_SID' "$SNAPSHOT_FILE" 2>/dev/null)"; new="${new:-0}"
-  if [ "$prev" -ge 3 ] && [ "$new" -eq 0 ]; then
+  # One sid is one line in a state file, so a line count IS the session count.
+  # Computed from the store as it stands at exit — i.e. after the thaw
+  # confirmation pass below has retired anything whose sessions are live again.
+  store=0
+  if [ -n "$_CC_STORE_NS" ]; then
+    store="$(cat "$_CC_STORE_NS"/*.state 2>/dev/null | grep -c 'CLAUDE_SID')"
+    case "${store:-}" in ''|*[!0-9]*) store=0 ;; esac
+  fi
+  if [ "$prev" -ge 3 ] && [ "$new" -eq 0 ] && [ "$prev" -gt "$store" ]; then
     mkdir -p "$(dirname "$guard_log")"
-    printf '[%s] BLOCKED near-total-wipe save: last had %s CLAUDE_SID, new had 0 — keeping good snapshot\n' \
-      "$(date '+%Y-%m-%d %H:%M:%S')" "$prev" >> "$guard_log"
+    printf '[%s] BLOCKED near-total-wipe save: last had %s CLAUDE_SID, new had 0, store holds %s — keeping good snapshot\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "$prev" "$store" >> "$guard_log"
     cat "$last_guard" > "$SNAPSHOT_FILE" 2>/dev/null || true
   fi
 }
 trap clobber_guard EXIT
+
+# ── Freeze-store heartbeat ───────────────────────────────────────────────────
+# Everything in this block is ABOVE the two early exits further down ("no by-pid
+# dir", "no live panes"). Those exits are statements about SID ENRICHMENT and say
+# nothing about the store, but they used to skip every line after them — so on a
+# machine with no registered session the 15-minute heartbeat did no heartbeat
+# work at all.
+#
+# The thaw-confirmation pass (§4.2 step 10). cc_thaw.sh deliberately does NOT
+# archive on a successful thaw: a reboot in the thaw→save gap must find a
+# recoverable, listed, thawable entry rather than bare shells and nothing. The
+# entry is retired HERE, once the sessions it holds are demonstrably running
+# again.
+#
+# The evidence is the live process table, not this snapshot. This pass sits
+# above the enrichment (it must, or the early exits would bypass it), so the
+# snapshot carries no sentinels yet — and a token written into a file is a weaker
+# claim than a process actually running with it. A thaw whose relaunch silently
+# failed therefore KEEPS its entry, which is the safe direction. The `ps` is
+# taken lazily: a store with nothing awaiting confirmation costs zero forks.
+_cc_confirm_thaws() {
+  local ns="$1" state ps_file key sid all_live dst
+  ps_file=""
+  for state in "$ns"/*.state; do
+    [ -f "$state" ] || continue
+    [ -n "$(cc_store_scalar "$state" thawed_at)" ] || continue
+    # Fail closed: an unreadable entry is never archived, never deleted (ext #13).
+    cc_store_verify "$state" || continue
+    if [ -z "$ps_file" ]; then
+      ps_file="${SNAPSHOT_FILE}.thawps.$$"
+      cc_proc_ps_snapshot "$ps_file" || { rm -f "$ps_file"; return 0; }
+    fi
+    all_live=1
+    for sid in $(cc_store_sids "$state" primary); do
+      grep -qF -- "$sid" "$ps_file" 2>/dev/null || { all_live=0; break; }
+    done
+    [ "$all_live" = "1" ] || continue
+    key="$(cc_store_scalar "$state" key)"
+    [ -n "$key" ] || continue
+    dst="$(cc_store_archive "$key")" || continue
+    rm -f "$(cc_store_banner_path "$key")" 2>/dev/null
+    _cc_log "THAW-CONFIRMED key=$key: every session is live again — archived to $dst"
+  done
+  [ -n "$ps_file" ] && rm -f "$ps_file"
+  return 0
+}
+
+# §4.3 g. The sweep is the only thing reachable from a save that can freeze
+# anything, so it is launched DETACHED (never inline in the save hook) and only
+# when the user has actually turned autofreeze on — with it off the sweep is a
+# no-op that would still fork a shell every 15 minutes for nothing.
+_cc_kick_sweep() {
+  local script
+  [ "$(_cc_opt @claude-continuity-autofreeze off)" = "on" ] || return 0
+  script="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/cc_freeze.sh"
+  [ -x "$script" ] || return 0
+  $TMUX_CMD run-shell -b "'$script' sweep" 2>/dev/null || true
+}
+
+if [ -n "$_CC_STORE_NS" ] && type cc_ledger_tick >/dev/null 2>&1; then
+  cc_ledger_tick
+  _cc_confirm_thaws "$_CC_STORE_NS"
+  _cc_kick_sweep
+fi
 
 # ── Repair collapsed pane lines (empty pane_title) ───────────────────────────
 # tmux-resurrect's save format writes each pane as tab-separated columns:
@@ -95,11 +251,20 @@ else
   rm -f "$realigned"
 fi
 
-panes_dir="$(tmux show-option -gqv @claude-continuity-panes-dir 2>/dev/null)"
+panes_dir="$($TMUX_CMD show-option -gqv @claude-continuity-panes-dir 2>/dev/null)"
 panes_dir="${panes_dir:-$HOME/.config/tmux-claude/panes}"
 by_pid_dir="${panes_dir}/by-pid"
 
 [ -d "$by_pid_dir" ] || exit 0
+
+# The climb below lives in lib/. Without it there is no way to enrich anything,
+# and silently writing a tokenless snapshot is exactly the failure the clobber
+# guard exists to catch — so say so loudly and let the guard (still armed on
+# EXIT) keep the good snapshot.
+if ! type cc_proc_sidmap >/dev/null 2>&1; then
+  _cc_log "EXIT: lib/cc_proc.sh not loadable from ${_CC_LIB_DIR:-$(dirname "$0")/lib} — snapshot NOT enriched"
+  exit 0
+fi
 
 # ── Garbage collect orphaned PID-keyed sidecars ──────────────────────────────
 for f in "${by_pid_dir}"/*.session-id; do
@@ -115,7 +280,7 @@ done
 
 # ── Build pane → session_id mapping from live tmux state ─────────────────────
 # For each tmux pane, find the Claude process and look it up in the by-pid
-# sidecar dir. Output: one line per pane with format "<S>:<W>.<P> <session_id>".
+# sidecar dir.
 #
 # We do NOT enumerate candidate PIDs downward from the pane (pane_pid + its
 # direct children). That was the old approach and it silently found NOTHING on
@@ -126,216 +291,58 @@ done
 # puts 1Password's `op` between the shell and Claude, so the process tree is
 #     zsh (pane_pid) → op run → claude
 # and Claude is a GRANDchild. A depth-1 search misses it, SOURCE 1 never
-# matches, and the only surviving source is the cmdline scrape below — which
-# fires only for sessions that ALREADY carry `--resume <uuid>`. Net effect:
-# every FRESH session (typed `c`, or `c --worktree foo`) was saved with no
-# CLAUDE_SID and came back from restore as a brand-new empty session. Measured
-# on a real snapshot: 0 of 46 panes matched via SOURCE 1, and all 19 panes with
-# no `--resume` on their cmdline lost their session permanently.
+# matches, and the only surviving source is a cmdline scrape — which fires only
+# for sessions that ALREADY carry `--resume <uuid>`. Net effect: every FRESH
+# session (typed `c`, or `c --worktree foo`) was saved with no CLAUDE_SID and
+# came back from restore as a brand-new empty session. Measured on a real
+# snapshot: 0 of 46 panes matched via SOURCE 1, and all 19 panes with no
+# `--resume` on their cmdline lost their session permanently.
 #
-# So climb UPWARD instead: start at each registered PID and walk the parent
-# chain until we land on a pane_pid. This is depth-agnostic (op, direnv, mise,
-# a login shell, any future wrapper), and it is cheaper — the whole join is one
-# `ps` snapshot and one awk pass instead of two `pgrep` forks per pane.
-#
-# Ties are broken by DEPTH: the shallowest process that climbs to a given pane
-# wins. That keeps a nested Claude (one spawned by an agent's Bash tool, several
-# levels down) from shadowing the pane's own session.
+# So the climb goes UPWARD instead, in lib/cc_sidmap.awk: start at each
+# registered PID and walk the parent chain until it lands on a pane_pid. It is
+# depth-agnostic (op, direnv, mise, a login shell, any future wrapper), ties are
+# broken by DEPTH so a nested Claude cannot shadow the pane's own session, and
+# the whole join is one `ps` snapshot and one awk pass. cc_proc_sidmap wraps it
+# with the ;DUP= interpretation, so an already-owned session id can never reach
+# a caller that would mistake it for a session token.
 declare_map_file="${SNAPSHOT_FILE}.sidmap.$$"
 panes_file="${SNAPSHOT_FILE}.panes.$$"
 ps_file="${SNAPSHOT_FILE}.ps.$$"
 registry_file="${SNAPSHOT_FILE}.registry.$$"
 # Keep the clobber_guard on EXIT and add temp-file cleanup ahead of it.
-trap 'rm -f "$declare_map_file" "$panes_file" "$ps_file" "$registry_file" "${SNAPSHOT_FILE}.enrich.$$" "${SNAPSHOT_FILE}.strip.$$"; clobber_guard' EXIT
+trap 'rm -f "$declare_map_file" "$panes_file" "$ps_file" "$registry_file" "${SNAPSHOT_FILE}.enrich.$$" "${SNAPSHOT_FILE}.strip.$$" "${SNAPSHOT_FILE}.thawps.$$"; clobber_guard' EXIT
 
-launch_dir="$(tmux show-option -gqv @claude-continuity-launch-dir 2>/dev/null)"
+launch_dir="$($TMUX_CMD show-option -gqv @claude-continuity-launch-dir 2>/dev/null)"
 launch_dir="${launch_dir:-$HOME/.config/tmux-claude/launch}"
 
-# Shared with post_restore.sh so a boot's save-side and restore-side notes land
-# in one file — the thing you `tail` after a reboot. CC_SAVE_LOG overrides it for
-# tests, which must not append to the user's real log.
-if [ -z "${CC_SAVE_LOG:-}" ]; then
-  CC_SAVE_LOG="$(tmux show-option -gqv @claude-continuity-log-file 2>/dev/null)"
-  CC_SAVE_LOG="${CC_SAVE_LOG:-$HOME/.tmux/scripts/claude-continuity-restore.log}"
-fi
-_CC_SAVE_LOG="$CC_SAVE_LOG"
-
-tmux list-panes -a -F '#{pane_pid}	#S:#I.#P	#{pane_id}' 2>/dev/null > "$panes_file"
+$TMUX_CMD list-panes -a -F '#{pane_pid}	#S:#I.#P	#{pane_id}' 2>/dev/null > "$panes_file"
 [ -s "$panes_file" ] || exit 0
-ps -axo pid=,ppid=,command= 2>/dev/null > "$ps_file"
+cc_proc_ps_snapshot "$ps_file" || exit 0
 
-# One awk pass over three inputs: the pane table, the process table, and every
-# by-pid sidecar. Files are told apart by name, so this stays portable (macOS
-# awk has no ARGIND) and costs a single fork.
+# Files are told apart by name inside the awk, so this stays portable (macOS awk
+# has no ARGIND) and costs a single fork.
 set -- "${by_pid_dir}"/*.session-id
 [ -f "$1" ] || set --
-awk -v panes="$panes_file" -v pstab="$ps_file" '
-  # ── pane table: pane_pid → "S:W.P" and pane id ──
-  FILENAME == panes {
-    n = split($0, f, "\t")
-    if (n >= 2 && f[1] != "") { target[f[1]] = f[2]; paneid[f[1]] = f[3] }
-    next
-  }
+cc_proc_sidmap "$panes_file" "$ps_file" "$@" > "$registry_file"
 
-  # ── process table: child → parent, plus argv for the cmdline fallback ──
-  FILENAME == pstab {
-    if ($1 == "" || $2 == "") next
-    parent[$1] = $2
-
-    # An MCP/headless helper. A Claude pane hosts its own MCP servers (claudish
-    # --mcp, mnemex --mcp, railway mcp, a python mcp-server.py) and those can
-    # themselves spawn Claude, so a session registered UNDER one is not the
-    # pane. Marked here, pruned during the climb.
-    if ($0 ~ /--mcp([ ]|$)/ || $0 ~ /mcp-server/ || $0 ~ /[ ]mcp([ ]|$)/) ismcp[$1] = 1
-
-    # A claudish LAUNCHER: its path ends in `/claudish` (the bin symlink), which
-    # is what makes `${argv##*/claudish}` yield clean flags. Deliberately NOT the
-    # bun `…/claudish/dist/index.js` child, and never an --mcp helper.
-    else if ($0 ~ /\/claudish([ ]|$)/) isclaudish[$1] = 1
-    # SOURCE 2 (cmdline fallback): scrape `--resume <uuid>` from the args.
-    # Catches RESUMED sessions whose SessionStart hook never registered a
-    # sidecar (hook timing / send-keys relaunch). Independent of the hook
-    # firing at all. Recorded here, applied in END only where SOURCE 1 is
-    # silent, preserving the original registry-wins precedence.
-    for (i = 3; i < NF; i++) {
-      w = $i
-      sub(/=.*$/, "", w)
-      if (w == "--resume" || w == "-r" || w == "--session-id") {
-        u = $(i + 1)
-        sub(/^.*=/, "", u)
-        if (length(u) == 36 && u ~ /^[0-9a-fA-F-]+$/) { scraped[$1] = u; break }
-      }
-    }
-    next
-  }
-
-  # ── by-pid sidecars: line 1 is the session UUID (line 2, if any, is a title) ──
-  FNR == 1 {
-    n = split(FILENAME, p, "/")
-    pid = p[n]; sub(/\.session-id$/, "", pid)
-    if (pid ~ /^[0-9]+$/ && $0 != "") registered[pid] = $0
-    next
-  }
-
-  # Climb from pid to the pane that owns it, in ONE walk that answers all three
-  # questions the caller needs: which pane, how deep, and whether a claudish
-  # launcher sits on the path. Sets the globals _o/_d/_cl rather than returning a
-  # tuple (awk has no structs, and three separate walks would triple the work).
-  #
-  # Returns "" in _o when the pid reaches no pane — a detached process, or one
-  # whose pane has since closed — and ALSO when the path crosses an MCP helper:
-  # such a session belongs to the helper, not to the pane hosting it.
-  function climb(pid,   cur, i) {
-    _o = ""; _d = -1; _cl = ""
-    cur = pid
-    for (i = 0; i < 24; i++) {
-      if (cur in ismcp) return
-      if (cur in target) { _o = cur; _d = i; return }
-      if (cur in isclaudish && _cl == "") _cl = cur
-      if (!(cur in parent)) return
-      if (parent[cur] == cur || parent[cur] == "0" || parent[cur] == "1") return
-      cur = parent[cur]
-    }
-  }
-  function claim(pid, sid,   o, d, cl) {
-    climb(pid); o = _o; d = _d; cl = _cl
-    if (o == "") return
-    if (o in best && bestdepth[o] <= d) return
-    best[o] = sid; bestdepth[o] = d; bestpid[o] = pid; bestclaudish[o] = cl
-  }
-  function owned(pid) { climb(pid); return _o }
-
-  END {
-    # SOURCE 1 (registry): the by-pid sidecar written by on_session_start.sh.
-    # Authoritative when the SessionStart hook fired — also covers FRESH
-    # sessions (a plain `claude`, or an interactive claudish, with no --resume
-    # on the cmdline), which are invisible to SOURCE 2.
-    for (pid in registered) claim(pid, registered[pid])
-    for (pid in scraped) if (!(owned(pid) in best)) claim(pid, scraped[pid])
-
-    # ── One session, one pane ────────────────────────────────────────────────
-    # Two panes can genuinely hold the SAME session id: an old restore routed one
-    # snapshot row into two panes (the dedup bug fixed in ed33bc1), and both
-    # relaunched `claude --resume <same uuid>`. The code bug is gone, but the
-    # STATE it created re-records itself on every save — both panes report the id,
-    # both rows carry it, and the next restore recreates the pair. Proven live:
-    # janus:1.1+2.1 and timeroo:1.1+1.2, each pair sharing one transcript file.
-    #
-    # Two Claude instances appending to one transcript is worse than a cosmetic
-    # duplicate, so break the loop here: exactly one pane keeps the id, the others
-    # are recorded with none and come back as fresh sessions. Selection is by
-    # sorted pane target — arbitrary but STABLE, so the same pane keeps it across
-    # saves instead of the pair ping-ponging. Dropped panes are printed with an
-    # empty sid so the shell can log them.
-    n = 0
-    for (pp in best) ord[++n] = pp
-    for (i = 1; i < n; i++)
-      for (j = i + 1; j <= n; j++)
-        if (target[ord[j]] < target[ord[i]]) { t = ord[i]; ord[i] = ord[j]; ord[j] = t }
-
-    for (i = 1; i <= n; i++) {
-      pp = ord[i]
-      if (best[pp] in sidowner) {
-        # The marker rides in the SID column, never as extra fields sitting
-        # behind empty ones. Tab is an IFS WHITESPACE character, so read
-        # collapses runs of tabs and drops leading ones: a row written with four
-        # tabs then DUP=x is read back with DUP=x in the sid slot, and it then
-        # gets embedded as a session token. That is exactly why every optional
-        # column in the resurrect format carries a colon sentinel instead of
-        # being left empty.
-        print target[pp] "\t" paneid[pp] "\t;DUP=" best[pp] "@" sidowner[best[pp]]
-        continue
-      }
-      sidowner[best[pp]] = target[pp]
-      # <target> <pane id> <sid> <winning pid> <claudish launcher pid, or empty>
-      print target[pp] "\t" paneid[pp] "\t" best[pp] "\t" bestpid[pp] "\t" bestclaudish[pp]
-    }
-  }
-' "$panes_file" "$ps_file" "$@" > "$registry_file"
-
-# Given a claudish LAUNCHER argv, produce the flags to replay after the base
-# `claudish` command, and (for interactive single-model sessions) the resolved
-# --model to inject. The rule mirrors how the user thinks about it:
-#   * argv already carries --model/--model-<role>/-m/--profile  -> replay verbatim
-#     (an explicit model, or a profile's whole role mapping — never collapse it).
-#   * argv carries none of those -> it was an interactive pick of ONE model, which
-#     survives only in CLAUDISH_ACTIVE_MODEL_NAME in the claude child's env; inject
-#     it, or the restored pane silently comes back on the default model.
-# Any pre-existing --resume is stripped; post_restore re-adds exactly one
-# authoritative --resume. Printed on one line with tabs/newlines removed, so the
-# result is safe as a single snapshot field. Args: <launcher_argv> <claude_pid>
-_cc_claudish_replay() {
-  local launcher_argv="$1" claude_pid="$2" flags model
-  flags="${launcher_argv##*/claudish}"     # drop the 'node /…/claudish' prefix
-  # Strip EVERY --resume, with or without its uuid, then collapse and trim. The
-  # bare mid-string case is load-bearing: a session restored by an older
-  # continuity carries a doubled `--resume --resume <uuid>`, and a dangling bare
-  # --resume would make the replay swallow the following flag as its value.
-  flags="$(printf '%s' "$flags" | sed -E 's/--resume( +[0-9a-fA-F-]{36})?//g; s/  +/ /g; s/^ +//; s/ +$//')"
-  case " $flags " in
-    *" --model "*|*" -m "*|*" --model-opus "*|*" --model-sonnet "*|*" --model-haiku "*|*" --model-subagent "*|*" --profile "*)
-      : ;;  # explicit model or profile → replay as-is
-    *)
-      model="$(ps eww -p "$claude_pid" 2>/dev/null | tr ' ' '\n' \
-        | sed -n 's/^CLAUDISH_ACTIVE_MODEL_NAME=//p' | head -1)"
-      [ -n "$model" ] && flags="${flags:+$flags }--model $model" ;;
-  esac
-  printf '%s' "$flags" | tr -d '\t\n'
-}
-
-while IFS=$'\t' read -r pane_target pane_id sid claude_pid claudish_pid; do
-  # A pane whose session id is already owned by another pane. It is recorded with
-  # NO sid, so it restores as a fresh session rather than as a second Claude
-  # attached to someone else's transcript. Logged because it is not self-evident
-  # afterwards: the row just looks like a pane that was never Claude.
-  case "$sid" in
-    ';DUP='*)
-      { mkdir -p "$(dirname "$_CC_SAVE_LOG")" 2>/dev/null && \
-        printf '[%s] DUP-SESSION %s dropped: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
-          "$pane_target" "${sid#;DUP=}" >> "$_CC_SAVE_LOG"; } 2>/dev/null || true
-      continue ;;
-  esac
+# ── The pane → (sid, typed command, claudish replay) map ─────────────────────
+# One TAGGED record per pane. Every optional value is a ;PREFIX=-tagged token,
+# scanned by prefix and never by position, and a value that does not exist is
+# OMITTED rather than written as an empty column — which is the whole of the L1
+# fix. cc_proc_sidmap's own output is tagged for the same reason.
+while IFS= read -r _rec; do
+  case "$_rec" in ';TARGET='*) ;; *) continue ;; esac
+  pane_target="$(_cc_tag "$_rec" ';TARGET=')" || continue
+  # A ;DUP= record carries no ;SID=: its session id is already owned by another
+  # pane, so this one is recorded with none and comes back as a fresh session
+  # rather than as a second Claude appending to someone else's transcript.
+  # cc_proc_sidmap has already logged the drop.
+  sid="$(_cc_tag "$_rec" ';SID=')" || continue
   [ -n "$pane_target" ] && [ -n "$sid" ] || continue
+  pane_id="$(_cc_tag "$_rec" ';PANEID=')" || pane_id=""
+  claude_pid="$(_cc_tag "$_rec" ';PID=')" || claude_pid=""
+  claudish_pid="$(_cc_tag "$_rec" ';CLPID=')" || claudish_pid=""
+  [ "$claudish_pid" = "-" ] && claudish_pid=""
 
   # The command as the user actually TYPED it, recorded by the preexec hook in
   # claude-continuity.zsh (see there for why ps cannot supply this). Base64 so an
@@ -358,7 +365,10 @@ while IFS=$'\t' read -r pane_target pane_id sid claude_pid claudish_pid; do
     [ -n "$launcher_argv" ] && replay="$(_cc_claudish_replay "$launcher_argv" "$claude_pid")"
   fi
 
-  printf '%s\t%s\t%s\t%s\n' "$pane_target" "$sid" "$launch_b64" "$replay"
+  _map=";TARGET=${pane_target}	;SID=${sid}"
+  [ -n "$launch_b64" ] && _map="${_map}	;CMD=${launch_b64}"
+  [ -n "$replay" ]     && _map="${_map}	;REPLAY=${replay}"
+  printf '%s\n' "$_map"
 done < "$registry_file" > "$declare_map_file"
 
 # ── Enrich the snapshot ──────────────────────────────────────────────────────
@@ -401,12 +411,27 @@ $rest
 EOF
   pane_target="${r_sess}:${r_win}.${r_pane}"
 
-  # One awk pass per row, three fields out, so a pane's row is enriched with
-  # whichever of them apply. A claudish pane carries BOTH a SID (so the boot
-  # verdict counts it and post_restore has its resume token) AND the replay flags
-  # (so post_restore relaunches `claudish <flags> --resume <sid>`).
-  IFS=$'\t' read -r matched_sid matched_cmd matched_replay <<EOF
-$(awk -F'\t' -v t="$pane_target" '$1 == t {print $2 "\t" $3 "\t" $4; exit}' "$declare_map_file")
+  # One awk pass per row, ONE TAGGED FIELD PER LINE, read back with IFS= so the
+  # delimiter is removed from the problem entirely. This is the L1 fix: the old
+  # form projected four TAB-separated fields into three variables, and a pane
+  # with no typed command (an empty middle column) collapsed on read — the
+  # claudish replay flags landed in the ;CLAUDE_CMD= slot and ;CLAUDISH_REPLAY=
+  # was never emitted. A claudish pane then restored as a bare `claude --resume`.
+  # Reproduced on /bin/bash 3.2.57 before the fix; asserted end-to-end by
+  # tests/sidmap_field_assign.sh.
+  #
+  # A claudish pane carries BOTH a SID (so the boot verdict counts it and
+  # post_restore has its resume token) AND the replay flags (so post_restore
+  # relaunches `claudish <flags> --resume <sid>`).
+  matched_sid=""; matched_cmd=""; matched_replay=""
+  while IFS= read -r _f; do
+    case "$_f" in
+      ';SID='*)    matched_sid="${_f#;SID=}" ;;
+      ';CMD='*)    matched_cmd="${_f#;CMD=}" ;;
+      ';REPLAY='*) matched_replay="${_f#;REPLAY=}" ;;
+    esac
+  done <<EOF
+$(awk -F'\t' -v t=";TARGET=$pane_target" '$1 == t { for (i = 2; i <= NF; i++) print $i; exit }' "$declare_map_file")
 EOF
 
   if [ -n "$matched_sid" ]; then
@@ -424,4 +449,5 @@ rm -f "$declare_map_file"
 # Drop the temp-cleanup+guard trap (temps already cleaned) and run the guard
 # once, explicitly, against the now-enriched snapshot.
 trap - EXIT
+rm -f "$panes_file" "$ps_file" "$registry_file"
 clobber_guard

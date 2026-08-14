@@ -440,6 +440,99 @@ if [ "$TMUX_RUNNING" = true ]; then
   fi
 fi
 
+# ── Check 10: Frozen windows ─────────────────────────────────────────────────
+
+section "10. Frozen windows"
+
+store_sh="$CURRENT_DIR/lib/cc_store.sh"
+popup_sh="$CURRENT_DIR/cc_popup.sh"
+thaw_sh="$CURRENT_DIR/cc_thaw.sh"
+
+if [ "$TMUX_RUNNING" != true ]; then
+  warn "tmux not running — the frozen inventory needs a live server"
+elif [ ! -f "$popup_sh" ] || [ ! -f "$store_sh" ]; then
+  warn "freeze/thaw scripts not installed here — skipping"
+else
+  store_dir="$(bash "$store_sh" dir 2>/dev/null)"
+  inv="$(mktemp)"
+  bash "$popup_sh" --list 2>/dev/null > "$inv"
+
+  count_of() { awk -F'\t' -v s="$1" '$1 == s' "$inv" | wc -l | tr -d ' '; }
+  n_frozen="$(count_of FROZEN)"
+  n_detached="$(count_of DETACHED)"
+  n_foreign="$(count_of FOREIGN)"
+  n_orphan="$(count_of ORPHAN)"
+  freed="$(awk -F'\t' '$1 == "FROZEN" { s += $6 }
+    END { if (s >= 1073741824) printf "~%.1fG", s / 1073741824
+          else if (s >= 1048576) printf "~%.0fM", s / 1048576
+          else printf "~%dK", s / 1024 }' "$inv")"
+
+  info "store: $store_dir"
+  if [ "$n_frozen" -eq 0 ]; then
+    ok "no frozen windows"
+  else
+    ok "$n_frozen frozen window(s), $freed held (approximate — shared pages are counted once per process)"
+    awk -F'\t' '$1 == "FROZEN" { printf "    %s:%s  %s  (%s panes, %s session ids, key %s)\n", $2, $3, $4, $7, $8, $9 }' "$inv"
+  fi
+
+  # Unclaimed: a stored entry no live window carries. Inert by design — it can
+  # never resolve onto a neighbouring window — but it is still holding session
+  # ids, so it is either woken into a named window or discarded.
+  if [ "$n_detached" -gt 0 ]; then
+    warn "$n_detached unclaimed entry(ies) — no live window claims them"
+    awk -F'\t' '$1 == "DETACHED" { printf "    %s  was %s:%s \"%s\"\n", $9, $2, $3, $4 }' "$inv"
+    info "Wake one into a window you name:  $thaw_sh thaw --into <session:index> <key>"
+    if ask_yn "Discard the $n_detached unclaimed entry(ies)? (nothing is killed; the session ids stay in the freeze log)"; then
+      awk -F'\t' '$1 == "DETACHED" { print $9 }' "$inv" | while read -r k; do
+        [ -n "$k" ] && bash "$thaw_sh" discard --yes "$k"
+      done
+      ok "discarded"
+    fi
+  fi
+
+  # A tombstone whose state file is gone: the window is a shell wearing a frozen
+  # title. Nothing is deleted and nothing is respawned — this is reported, not
+  # repaired, because the repair would have to guess.
+  if [ "$n_orphan" -gt 0 ]; then
+    fail "$n_orphan orphan tombstone(s) — a ❄ window whose state file is missing or unreadable"
+    awk -F'\t' '$1 == "ORPHAN" { printf "    %s:%s \"%s\"  key %s\n", $2, $3, $4, $9 }' "$inv"
+    log_file="$(tmux show-option -gqv @claude-continuity-log-file 2>/dev/null)"
+    log_file="${log_file:-$HOME/.tmux/scripts/claude-continuity-restore.log}"
+    info "Session ids for these keys are recoverable from ${log_file%.log}-freeze.log:"
+    info "  grep <key> ${log_file%.log}-freeze.log"
+  fi
+
+  # Another live tmux server owns these. Every claim, thaw and discard refuses
+  # them, on purpose.
+  if [ "$n_foreign" -gt 0 ]; then
+    warn "$n_foreign entry(ies) belong to a live foreign tmux server — untouchable from here"
+    awk -F'\t' '$1 == "FOREIGN" { printf "    %s  %s:%s\n", $9, $2, $3 }' "$inv"
+  fi
+
+  # A state file that does not verify is never listed as thawable. Pruning MOVES
+  # it to archive/; this plugin never deletes a file that can hold a session id.
+  bad_keys=""
+  n_bad=0
+  for k in $(bash "$store_sh" keys 2>/dev/null); do
+    if ! bash "$store_sh" verify "$k" >/dev/null 2>&1; then
+      bad_keys="$bad_keys $k"
+      ((n_bad++))
+    fi
+  done
+  if [ "$n_bad" -gt 0 ]; then
+    warn "$n_bad unreadable state file(s) in the store"
+    for k in $bad_keys; do info "$store_dir/$k.state"; done
+    if ask_yn "Prune them? (moved to $store_dir/archive, never deleted)"; then
+      for k in $bad_keys; do bash "$thaw_sh" discard --yes "$k"; done
+      ok "pruned to archive/"
+    fi
+  elif [ "$n_frozen" -gt 0 ] || [ "$n_detached" -gt 0 ]; then
+    ok "every state file in the store verifies"
+  fi
+
+  rm -f "$inv"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
