@@ -113,20 +113,72 @@ _CC_STORE_NS="$(_cc_ns_dir_if_exists)"
 # exact-zero wipe, so legitimate pane closures (never exactly zero while others
 # remain) pass through untouched.
 #
-# THE STORE TERM. A frozen window contributes no ;CLAUDE_SID= to the snapshot —
-# its sessions live in the store, not in the photograph. Freezing every Claude
-# window therefore drives `new` to 0 legitimately, and the two-term guard would
+# ── THE INVARIANT THIS GUARD ASSERTS ─────────────────────────────────────────
+#
+#     Every session the PREVIOUS snapshot recorded is still accounted for:
+#     either it is still live (in the new snapshot), or this machine now holds
+#     it in the freeze store, BY ID. A save that cannot account for a session
+#     the last one recorded is a save that would forget it.
+#
+# The guard has now been the subject of two separate bugs, so the accounting is
+# spelled out. A frozen window contributes no ;CLAUDE_SID= to the snapshot — its
+# sessions live in the store, not in the photograph — so freezing every Claude
+# window drives `new` to 0 legitimately, and the original two-term guard would
 # then block EVERY save and pin `last` to the pre-freeze snapshot for good: the
-# one mechanism that exists to prevent data loss would become the data loss. The
-# third term reads as "more sessions vanished than the freeze store can account
-# for":
-#     freeze 24 of 24  -> prev=24 new=0 store=24 -> suppressed (correct)
-#     wipe, 2 frozen   -> prev=22 new=0 store=2  -> FIRES     (correct)
-#     wipe, none frozen-> prev=24 new=0 store=0  -> FIRES     (unchanged)
-# Note it is `prev > store`, not `new + store`: the additive form would suppress
-# the middle case, which is a real wipe.
+# one mechanism that exists to prevent data loss would become the data loss.
+#
+# The accounting is done by IDENTITY, never by counting. A count term
+# (`prev > store_size`) is what the first attempt used, and it degrades exactly
+# backwards: the more sessions the store holds, the larger `store_size` is, and
+# the more readily a genuine wipe of unrelated live sessions is waved through —
+# a big store means MORE ids are at stake, not fewer. So `accounted` is the
+# number of the PREVIOUS SNAPSHOT'S OWN session ids that appear in the store
+# today, and it can never be inflated by an entry that has nothing to do with
+# the sessions that just vanished:
+#
+#   freeze 24 of 24, store holds 30 total  -> prev=24 accounted=24 -> suppressed
+#   wipe of 22 live,  2 frozen since       -> prev=22 accounted=2   -> FIRES
+#   wipe of 22 live, store holds 300       -> prev=22 accounted=0   -> FIRES
+#   wipe, nothing ever frozen              -> prev=24 accounted=0   -> FIRES
+#
+# Every failure degrades to the SAFE side: an unreadable store, a missing store,
+# a store whose files do not parse, or a `last` in some format whose ids we
+# cannot extract all yield accounted=0, which keeps the guard ARMED. Nothing
+# about this guard is ever weakened by something we could not read.
+#
+# Count the previous snapshot's OWN session ids that the freeze store holds
+# today. Pass 1 collects the ids the store holds; pass 2 walks `last` and counts
+# its ids that are in that set, de-duplicated. Store files are read as
+# whitespace tokens (a sid never contains whitespace) and `last` is split on
+# TABs, which is the only delimiter its rows have.
+_cc_guard_accounted() {
+  local last="$1" ns="$2" n
+  [ -n "$ns" ] || { printf '0'; return 0; }
+  n="$(cat "$ns"/*.state 2>/dev/null | awk -v lastf="$last" '
+    { for (i = 1; i <= NF; i++) if (index($i, ";CLAUDE_SID=") == 1) held[substr($i, 13)] = 1 }
+    END {
+      n = 0
+      while ((getline line < lastf) > 0) {
+        c = split(line, f, "\t")
+        for (i = 1; i <= c; i++)
+          if (index(f[i], ";CLAUDE_SID=") == 1) {
+            s = substr(f[i], 13)
+            if (s != "" && (s in held) && !(s in seen)) { seen[s] = 1; n++ }
+          }
+      }
+      print n + 0
+    }' 2>/dev/null)"
+  case "${n:-}" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
 clobber_guard() {
-  local guard_log="$HOME/.tmux/scripts/claude-continuity-clobber-guard.log"
+  # The guard's own log. Derived, with an override, for one reason: this path
+  # used to be hardcoded into $HOME, so exercising the guard — the single most
+  # consequential branch in this file — wrote into the user's real diagnostic
+  # log from every test run, and the only "safe" way to verify it was not to.
+  # The default is byte-identical to what it always was.
+  local guard_log="${CC_GUARD_LOG:-$HOME/.tmux/scripts/claude-continuity-clobber-guard.log}"
   local last_guard; last_guard="$(dirname "$SNAPSHOT_FILE")/last"
   [ -e "$last_guard" ] || return 0
   # Don't guard against ourselves: if save.sh hasn't repointed yet, `last` is the
@@ -134,21 +186,20 @@ clobber_guard() {
   case "$(readlink "$last_guard" 2>/dev/null)" in
     "$(basename "$SNAPSHOT_FILE")") return 0 ;;
   esac
-  local prev new store
+  local prev new accounted
   prev="$(grep -c 'CLAUDE_SID' "$last_guard" 2>/dev/null)"; prev="${prev:-0}"
   new="$(grep -c 'CLAUDE_SID' "$SNAPSHOT_FILE" 2>/dev/null)"; new="${new:-0}"
-  # One sid is one line in a state file, so a line count IS the session count.
-  # Computed from the store as it stands at exit — i.e. after the thaw
+  # Computed from the store as it stands at EXIT — i.e. after the thaw
   # confirmation pass below has retired anything whose sessions are live again.
-  store=0
-  if [ -n "$_CC_STORE_NS" ]; then
-    store="$(cat "$_CC_STORE_NS"/*.state 2>/dev/null | grep -c 'CLAUDE_SID')"
-    case "${store:-}" in ''|*[!0-9]*) store=0 ;; esac
-  fi
-  if [ "$prev" -ge 3 ] && [ "$new" -eq 0 ] && [ "$prev" -gt "$store" ]; then
+  accounted="$(_cc_guard_accounted "$last_guard" "${_CC_STORE_NS:-}")"
+  # `prev` counts LINES matching CLAUDE_SID while `accounted` counts IDS; clamp
+  # so a malformed row carrying two ids can never make the store look like it
+  # accounts for more than the snapshot recorded.
+  [ "$accounted" -gt "$prev" ] && accounted="$prev"
+  if [ "$prev" -ge 3 ] && [ "$new" -eq 0 ] && [ "$prev" -gt "$accounted" ]; then
     mkdir -p "$(dirname "$guard_log")"
-    printf '[%s] BLOCKED near-total-wipe save: last had %s CLAUDE_SID, new had 0, store holds %s — keeping good snapshot\n' \
-      "$(date '+%Y-%m-%d %H:%M:%S')" "$prev" "$store" >> "$guard_log"
+    printf '[%s] BLOCKED near-total-wipe save: last had %s CLAUDE_SID, new had 0, the freeze store accounts for %s of them (%s unaccounted) — keeping good snapshot\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "$prev" "$accounted" "$((prev - accounted))" >> "$guard_log"
     cat "$last_guard" > "$SNAPSHOT_FILE" 2>/dev/null || true
   fi
 }
@@ -173,6 +224,47 @@ trap clobber_guard EXIT
 # claim than a process actually running with it. A thaw whose relaunch silently
 # failed therefore KEEPS its entry, which is the safe direction. The `ps` is
 # taken lazily: a store with nothing awaiting confirmation costs zero forks.
+#
+# "The session is running again" is NOT "this uuid appears somewhere in the
+# process table". A session id is a plain string that turns up in argv for
+# reasons that have nothing to do with the session being alive — an editor
+# holding `…/projects/<uuid>.jsonl` open, a `grep <uuid>` over the logs, an agent
+# inspecting a transcript, this very machine running dozens of Claude sessions
+# whose command lines carry ids. Confirming on any of those would archive an
+# entry whose session is not actually back.
+#
+# So a match must be BOTH: the id in a session-SELECTION flag, and the process
+# carrying it must classify as a Claude launcher through the same shared
+# classifier post_restore uses to decide what to relaunch. `grep --resume <uuid>`
+# fails the second test (its exec token is grep); `vim …/<uuid>.jsonl` fails the
+# first. A launcher form the classifier deliberately rejects (a one-shot `-p`,
+# a `--name` whose quoting a flattened argv has already destroyed) also fails,
+# and the entry simply survives to the next save — fail-closed, by design.
+_cc_sid_is_live() {
+  local sid="$1" psf="$2" line cmd
+  # grep first so the shell loop below only ever sees the handful of lines that
+  # mention the id at all, instead of the whole process table.
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    set -f
+    # shellcheck disable=SC2086
+    set -- $line
+    set +f
+    [ "$#" -ge 3 ] || continue
+    shift 2                      # drop the pid and ppid columns
+    cmd="$*"
+    case " $cmd " in
+      *" --resume $sid "*|*" --resume=$sid "*|*" -r $sid "*|\
+      *" --session-id $sid "*|*" --session-id=$sid "*) ;;
+      *) continue ;;
+    esac
+    _cc_is_claude_launcher "$cmd" && return 0
+  done <<EOF
+$(grep -F -- "$sid" "$psf" 2>/dev/null)
+EOF
+  return 1
+}
+
 _cc_confirm_thaws() {
   local ns="$1" state ps_file key sid all_live dst
   ps_file=""
@@ -187,7 +279,7 @@ _cc_confirm_thaws() {
     fi
     all_live=1
     for sid in $(cc_store_sids "$state" primary); do
-      grep -qF -- "$sid" "$ps_file" 2>/dev/null || { all_live=0; break; }
+      _cc_sid_is_live "$sid" "$ps_file" || { all_live=0; break; }
     done
     [ "$all_live" = "1" ] || continue
     key="$(cc_store_scalar "$state" key)"
