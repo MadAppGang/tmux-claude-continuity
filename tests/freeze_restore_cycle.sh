@@ -36,6 +36,15 @@
 
 set -uo pipefail
 
+# ── RESURRECT SAVE-SIDE ISOLATION ────────────────────────────────────────────
+# RESURRECT_FILE redirects resurrect READS. Only @resurrect-dir redirects its
+# WRITES. A test that triggers a save without setting it deposits fixture
+# snapshots in the user's live resurrect directory and can leave `last`
+# pointing at one. See tests/lib/resurrect_guard.sh for the measured damage.
+. "$(cd "$(dirname "$0")" && pwd)/lib/resurrect_guard.sh" || {
+  echo "ABORT: tests/lib/resurrect_guard.sh is missing"; exit 1; }
+cc_register_test_session _seed work legacy alpha beta lvl cA cB cC cD cE
+
 SOCKET="ccrc$$"
 TD="/tmp/ccrc-$$"
 FD="$TD/frozen"
@@ -107,7 +116,10 @@ _teardown() {
   _kill_fixtures
   rm -rf "$TD"
 }
-trap _teardown EXIT INT TERM
+# Re-wrap the teardown so a leak into the real resurrect dir fails the run
+# even on the early-abort paths that never reach the final assertions.
+_cc_teardown_guarded() { _teardown; cc_warn_on_resurrect_leak || exit 1; }
+trap _cc_teardown_guarded EXIT INT TERM
 
 mkdir -p "$FD" "$PD/by-pid" "$LD" "$QD" "$RD" "$BIN" "$FIX" "$SHIM"
 
@@ -187,6 +199,10 @@ _opts() {
   _t set-option -g @claude-continuity-claudish-cmd "claudish" >/dev/null
   _t set-option -g @claude-continuity-freeze-dir   "$FD" >/dev/null
   _t set-option -g @resurrect-dir                  "$RD" >/dev/null
+  # Pre-flight: ask the SERVER what it will actually use and refuse to run if
+  # the answer is the user's real directory. A set-option that ran too early or
+  # at the wrong scope leaves the default in place, and only asking catches it.
+  cc_guard_resurrect_dir "$RD" tmux -L "$SOCKET" -f /dev/null
 }
 
 _pane_id_of() { _t list-panes -t "$1" -F '#{pane_index} #{pane_id}' 2>/dev/null \
@@ -254,7 +270,11 @@ _list() {
   CC_TEST=1 TMUX_CMD="$TMUX_CMD_STR" CC_FREEZE_DIR="$FD" CC_LOG_FILE="$LOG" \
   CC_NOW="${CC_NOW_OVERRIDE:-$NOW}" bash "$POPUP" --list 2>/dev/null
 }
-_list_row() { _list | awk -F'\t' -v s="$1" -v w="$2" '$2==s && $3==w { print; exit }'; }
+# The inventory is a TREE now: a session row, then window rows, then pane rows.
+# Pin the lookup to the WINDOW level (column 11) — without it, "the first row
+# whose session and index match" would silently start matching a pane row the
+# day a window row is reordered or dropped.
+_list_row() { _list | awk -F'\t' -v s="$1" -v w="$2" '$11=="window" && $2==s && $3==w { print; exit }'; }
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PHASE A — the pre-restart server
@@ -318,17 +338,28 @@ echo ""
 echo "[B] FREEZE work:2"
 OUT="$(_freeze freeze --no-save work:2 2>/dev/null)"; RC=$?
 printf '    exit=%s stdout=[%s]\n' "$RC" "$OUT"
-assert_eq "verb is FROZE" "$(_field "$OUT" 1)" "FROZE"
-KEY="$(_field "$OUT" 3)"
+# THE ATOM IS A PANE: a 2-pane window yields TWO tombstones and TWO entries, and
+# BOTH have to survive the save/restore round trip. Carrying only the first pane
+# through phases C and D would leave the second entry with no tombstone to
+# re-claim, which post_restore correctly reports as a stale intent — a fixture
+# artefact that would look like a passing AC4.
+assert_eq "both panes of the window froze" \
+  "$(printf '%s\n' "$OUT" | awk -F'\t' 'NF>=2 && $1!="WINDOW" && $1!="SESSION" {print $1}' | sort | tr '\n' ' ')" \
+  "FROZE FROZE "
+KEY="$(printf '%s\n'  "$OUT" | awk -F'\t' '$2=="work:2.1" {print $3; exit}')"
+KEY2="$(printf '%s\n' "$OUT" | awk -F'\t' '$2=="work:2.2" {print $3; exit}')"
 SF="$(_state_path "$KEY")"
-if [ -z "$SF" ] || [ ! -s "$SF" ]; then
-  no "state file written" "nothing to carry through the restart"
+if [ -z "$SF" ] || [ ! -s "$SF" ] || [ -z "$KEY2" ]; then
+  no "a state file per frozen pane" "nothing to carry through the restart"
   echo ""; echo "  Results: $pass passed, $fail failed"; exit 1
 fi
-ok "state file written ($SF)"
+ok "a state file per frozen pane ($SF)"
 TOMB_ID="$(_pane_id_of work:2 1)"
+TOMB_ID2="$(_pane_id_of work:2 2)"
 [ -n "$TOMB_ID" ] || TOMB_ID="__nopane__"
+[ -n "$TOMB_ID2" ] || TOMB_ID2="__nopane__"
 TOMB_TITLE="$(_t display-message -p -t "$TOMB_ID" '#{pane_title}' 2>/dev/null || true)"
+TOMB_TITLE2="$(_t display-message -p -t "$TOMB_ID2" '#{pane_title}' 2>/dev/null || true)"
 OLD_SERVER_PID="$(_scalar "$SF" server_pid)"
 OLD_WINDOW_ID="$(_scalar "$SF" window_id)"
 printf '    tombstone title: [%s]\n    recorded server_pid=%s window_id=%s\n' \
@@ -347,6 +378,7 @@ _row() { # <window index> <pane index> <title> <cmd> <full_command>
 {
   _row 1 1 "awake-pane"    claude "claude --dangerously-skip-permissions"
   _row 2 1 "$TOMB_TITLE"   sh     "sh"
+  _row 2 2 "$TOMB_TITLE2"  sh     "sh"
   _row 3 1 "idle-pane"     sh     "sh"
   _row 4 1 "vim-pane"      sh     "sh"
   _row 5 1 "active-pane"   sh     "sh"
@@ -363,9 +395,13 @@ assert_eq  "the snapshot still has one line per pane and no new line types" \
 assert_eq  "every line is still a pane line" \
   "$(awk -F'\t' '$1!="pane"' "$SNAP" | grep -c . | tr -d ' ')" "0"
 assert_has "the awake window's row carries its session id" "$ROW_AWAKE" ";CLAUDE_SID=$SID_AWAKE"
-assert_has "the frozen window's row carries the ❄ marker in the pane title" \
+assert_eq  "the frozen window contributes one row per frozen PANE" \
+  "$(printf '%s\n' "$ROW_FROZEN" | grep -c . | tr -d ' ')" "2"
+assert_has "the frozen window's first row carries the ❄ marker in the pane title" \
   "$ROW_FROZEN" "$(printf '\xe2\x9d\x84 FROZEN %s' "$KEY")"
-assert_hasnt "the frozen window's row carries NO session id" "$ROW_FROZEN" ";CLAUDE_SID="
+assert_has "its second row carries its own key in its own pane title" \
+  "$ROW_FROZEN" "$(printf '\xe2\x9d\x84 FROZEN %s' "$KEY2")"
+assert_hasnt "no frozen row carries a session id" "$ROW_FROZEN" ";CLAUDE_SID="
 
 # AC13's clock starts here: the ledger has just been ticked by this save.
 LEDGER_T0="$(date +%s)"
@@ -390,6 +426,7 @@ _opts
 # requires (see THE FIXTURE RULE above).
 _t new-session -d -s work -n awake    -c /tmp
 _t new-window  -t work:2 -n tofreeze  -c /tmp
+_t split-window -t work:2 -c /tmp
 _t new-window  -t work:3 -n idle-shell -c /tmp
 _t new-window  -t work:4 -n has-vim   -c /tmp
 _t new-window  -t work:5 -n active-win -c /tmp
@@ -397,6 +434,7 @@ _t kill-session -t _seed
 _grow_one "$(_pane_id_of work:4 1)" "$VIM_TREE_CMD" "$BIN" "/vim " "the restored vim fixture"
 _settitle work:1 1 "awake-pane"
 _settitle work:2 1 "$TOMB_TITLE"
+_settitle work:2 2 "$TOMB_TITLE2"
 _settitle work:3 1 "idle-pane"
 _settitle work:4 1 "vim-pane"
 _settitle work:5 1 "active-pane"
@@ -405,6 +443,7 @@ NEW_SERVER_PID="$(_t display-message -p '#{pid}')"
 NEW_WINDOW_ID="$(_t display-message -p -t work:2 '#{window_id}')"
 AWAKE_PANE="$(_pane_id_of work:1 1)"
 TOMB_PANE="$(_pane_id_of work:2 1)"
+TOMB_PANE2="$(_pane_id_of work:2 2)"
 printf '    new server pid=%s  work:2 window_id=%s\n' "$NEW_SERVER_PID" "$NEW_WINDOW_ID"
 assert_ne "the server really restarted (new pid)" "$NEW_SERVER_PID" "$OLD_SERVER_PID"
 
@@ -422,15 +461,28 @@ assert_eq "post_restore exits 0 on every path" "$RESTORE_RC" "0"
 echo ""
 echo "[D1] AC4: the frozen window comes back FROZEN, with zero resumes queued"
 assert_has "the tombstone row was re-claimed, by key" "$RESTORE_LOG" "FROZEN-CLAIMED"
-assert_has "the claim names this window and key" "$RESTORE_LOG" "key=$KEY"
-assert_eq  "the window carries the @cc-frozen claim again" "$(_frozen_opt work:2)" "$KEY"
+assert_has "the claim names this pane's key"     "$RESTORE_LOG" "key=$KEY"
+assert_has "and the second pane's key too"       "$RESTORE_LOG" "key=$KEY2"
+assert_eq  "BOTH tombstones were re-claimed, not just the first" \
+  "$(printf '%s\n' "$RESTORE_LOG" | grep -c 'FROZEN-CLAIMED' | tr -d ' ')" "2"
+# A frozen entry whose tombstone did not come back is a real miss and must be
+# reported as such; here every entry HAS a tombstone, so none may be stale.
+assert_hasnt "no frozen entry was left without its tombstone" "$RESTORE_LOG" "FROZEN-STALE-INTENT"
+# The claim is a PANE option under the pane atom; a `-w` read would pass
+# vacuously on an implementation that re-claimed nothing at all.
+assert_eq  "pane 1 carries its @cc-frozen claim again" \
+  "$(_t show-options -p -t "$TOMB_PANE" -v @cc-frozen 2>/dev/null || true)" "$KEY"
+assert_eq  "pane 2 carries its own claim, not its neighbour's" \
+  "$(_t show-options -p -t "$TOMB_PANE2" -v @cc-frozen 2>/dev/null || true)" "$KEY2"
 assert_eq  "allow-rename is off on the tombstone pane" \
   "$(_t show-options -p -t "$TOMB_PANE" -v allow-rename 2>/dev/null || true)" "off"
 assert_has "the tombstone pane still shows the ❄ title" "$(_titles_of work:2)" "FROZEN $KEY"
-assert_eq  "the frozen window still has exactly one pane" "$(_pane_count work:2)" "1"
-# The whole point of the feature: nothing is resumed for a frozen window.
+assert_eq  "the frozen window came back with both its panes" "$(_pane_count work:2)" "2"
+# The whole point of the feature: nothing is resumed for a frozen pane.
 assert_hasnt "no Claude resume was queued for the tombstone pane" \
   "$(_pending_for "$TOMB_PANE")" "--resume"
+assert_hasnt "nor for the second tombstone pane" \
+  "$(_pending_for "$TOMB_PANE2")" "--resume"
 assert_hasnt "the frozen window's session id was not resumed anywhere" \
   "$(cat $(_pending_files) 2>/dev/null)" "$SID_FROZEN"
 # The state file must be re-pointed at the LIVE server and window, or the next
@@ -462,8 +514,16 @@ echo "[D3] The inventory reports the two windows in different states"
 echo "    --- cc_popup.sh --list ---"; _list | sed 's/^/      /'; echo "    --------------------------"
 assert_eq "work:2 is FROZEN"  "$(_field "$(_list_row work 2)" 1)" "FROZEN"
 assert_eq "work:1 is AWAKE"   "$(_field "$(_list_row work 1)" 1)" "AWAKE"
-assert_eq "the frozen row carries the key" "$(_field "$(_list_row work 2)" 9)" "$KEY"
-assert_has "the boot verdict mentions the frozen inventory" "$RESTORE_LOG" "frozen window(s) held in the store"
+# The key lives on the PANE row now: a window holding two frozen panes holds two
+# DIFFERENT keys, so its container row has no single key to carry and honestly
+# reports "-". A consumer that wants keys must read the pane rows.
+assert_eq "both keys are carried, one per frozen pane row" \
+  "$(_list | awk -F'\t' '$11=="pane" && $2=="work" && $3==2 && $9!="-" {print $9}' | sort | tr '\n' ' ')" \
+  "$(printf '%s\n%s\n' "$KEY" "$KEY2" | sort | tr '\n' ' ')"
+# §3.5 requires the verdict to carry an informational clause naming what the
+# store is holding. The NOUN moved with the atom (windows -> entries), so the
+# assertion is on the clause, not on the word the window model happened to use.
+assert_has "the boot verdict mentions the frozen inventory" "$RESTORE_LOG" "held in the store"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PHASE E — AC11: an OLD-format snapshot
@@ -495,7 +555,13 @@ assert_eq  "post_restore exits 0"                    "$OLD_RC" "0"
 assert_has "the legacy claude row resumed"           "$(_pending_for "$LEG_A")" "--resume $SID_LEGACY"
 assert_has "the legacy claudish row resumed via claudish" "$(_pending_for "$LEG_B")" "claudish"
 assert_has "the legacy claudish replay flags survived"    "$(_pending_for "$LEG_B")" "--model g@gemini-3-pro"
-assert_hasnt "no frozen handling fired for an old snapshot" "$OLD_LOG" "FROZEN-"
+# AC11 is about the ROWS OF THAT SNAPSHOT: none of them carries a frozen marker,
+# so none may trigger frozen handling. The store still legitimately holds the
+# entries phase B created for `work`, and post_restore reporting on those is not
+# a violation — asserting "no FROZEN- line anywhere" would be asserting that the
+# store must be empty, which AC11 never says.
+assert_eq "no row of the old snapshot triggered frozen handling" \
+  "$(printf '%s\n' "$OLD_LOG" | grep 'FROZEN-' | grep -c 'legacy' | tr -d ' ')" "0"
 assert_eq  "legacy:1 is AWAKE" "$(_field "$(_list_row legacy 1)" 1)" "AWAKE"
 assert_eq  "legacy:2 is AWAKE" "$(_field "$(_list_row legacy 2)" 1)" "AWAKE"
 
@@ -505,7 +571,21 @@ assert_eq  "legacy:2 is AWAKE" "$(_field "$(_list_row legacy 2)" 1)" "AWAKE"
 echo ""
 echo "[F] AC13: idle age is read from the LEDGER, so a restart does not reset it"
 ELAPSED=$(( $(date +%s) - LEDGER_T0 ))
+# READ THIS BEFORE PINNING A CLOCK AGAIN.
+# Every other call in this file runs with CC_NOW pinned to $NOW (test start), so
+# that ages are golden-file comparable. An AGE assertion cannot: the reported age
+# is `CC_NOW - ledger_LAST`, and work:3's ledger LAST is its creation time, which
+# is ~0.1 s AFTER $NOW. So `LAST` and `NOW` land in the same wall-clock second
+# roughly three times in four, the subtraction clamps to 0, and this assertion
+# fails — not because the ledger was ignored (it is read; measured `;LAST=` held
+# the pre-restart activity while #{window_activity} held a later value), but
+# because the test froze the clock at a moment BEFORE the thing it is timing
+# existed. Measured gap: 0.099-0.111 s, crossing a second boundary 2 of 8 runs.
+# The fix is to let THIS read run on the real clock. Do not ask the
+# implementation to tie-break with >=; the clock-fallback rule is deliberate.
+CC_NOW_OVERRIDE="$(date +%s)"
 IDLE_ROW="$(_list_row work 3)"
+unset CC_NOW_OVERRIDE
 IDLE_SECS="$(_field "$IDLE_ROW" 5)"
 printf '    %s seconds of real time have passed since the ledger was ticked\n' "$ELAPSED"
 printf '    reported idle for work:3 = [%s]\n' "$IDLE_SECS"
@@ -516,7 +596,7 @@ case "$IDLE_SECS" in
        ok "idle age survived the server restart (>= 6s, not reset to ~0)"
      else
        no "idle age survived the server restart" \
-          "reported ${IDLE_SECS}s after ${ELAPSED}s — #{window_activity} was reset by the restart, so this is the live value, not the ledger's"
+          "reported ${IDLE_SECS}s after ${ELAPSED}s of real time — the restart reset #{window_activity} to ~0, so an age this small means the persisted ledger's ;LAST= was not what the age was computed from (FR3.2/FR5.5)"
      fi ;;
 esac
 
@@ -601,10 +681,13 @@ RUN="$(CC_NOW=$SWEEP_NOW CC_TEST=1 TMUX_CMD="$TMUX_CMD_STR" CC_FREEZE_DIR="$FD" 
        CC_LOG_FILE="$LOG" CC_NO_SAVE=1 CC_NO_NUDGE=1 bash "$FREEZE" sweep 2>/dev/null)"; RC=$?
 echo "    --- sweep ---"; printf '%s\n' "$RUN" | sed 's/^/      /'; echo "    -------------"
 assert_eq "exit code 0" "$RC" "0"
-FROZE_LINE="$(printf '%s\n' "$RUN" | awk -F'\t' '$1=="FROZE" && $2=="work:3"')"
-if [ -n "$FROZE_LINE" ]; then ok "AC6: work:3 was auto-frozen"
-else no "AC6: work:3 was auto-frozen" "no FROZE line for work:3"; fi
-assert_eq "work:3 collapsed to a tombstone pane" "$(_pane_count work:3)" "1"
+# The sweep still selects WINDOWS, but it freezes PANES, so its FROZE rows are
+# targeted `session:index.pane`. Matching on `$2=="work:3"` would now never hit.
+FROZE_LINE="$(printf '%s\n' "$RUN" | awk -F'\t' '$1=="FROZE" && $2 ~ /^work:3\./')"
+if [ -n "$FROZE_LINE" ]; then ok "AC6: every pane of work:3 was auto-frozen"
+else no "AC6: every pane of work:3 was auto-frozen" "no FROZE line for a pane of work:3"; fi
+assert_eq "work:3's pane count is unchanged — a freeze restructures nothing" \
+  "$(_pane_count work:3)" "1"
 assert_has "work:3's pane carries a ❄ title" "$(_titles_of work:3)" "$(printf '\xe2\x9d\x84 FROZEN')"
 assert_eq "work:3 now reports FROZEN in the inventory" "$(_field "$(_list_row work 3)" 1)" "FROZEN"
 assert_ne "a new state file was written" "$(_state_count)" "$STATES_BEFORE"
@@ -623,9 +706,20 @@ assert_has "AC7: the vim skip is logged with its reason"    "$FREEZE_LOG" "unsaf
 assert_has "AC8: the active-window skip is logged"          "$FREEZE_LOG" "active-window-of-attached-session"
 
 # stdout is a contract: nothing may be frozen that the sweep did not announce.
-ANNOUNCED="$(printf '%s\n' "$RUN" | awk -F'\t' '$1=="FROZE" && $2 ~ /^work:/ { print $2 }' | sort | tr '\n' ' ')"
-FROZEN_NOW="$(_list | awk -F'\t' '$1=="FROZEN" && $2=="work" && $3!=2 { print $2":"$3 }' | sort | tr '\n' ' ')"
+# The rows are per PANE now, so the announcement is projected back to the window
+# it names before being compared with the window-level inventory. Both sides are
+# de-duplicated, or a 2-pane window would announce twice and never match.
+ANNOUNCED="$(printf '%s\n' "$RUN" | awk -F'\t' '$1=="FROZE" && $2 ~ /^work:/ { sub(/\..*$/, "", $2); print $2 }' \
+             | sort -u | tr '\n' ' ')"
+FROZEN_NOW="$(_list | awk -F'\t' '$11=="window" && $1=="FROZEN" && $2=="work" && $3!=2 { print $2":"$3 }' \
+             | sort -u | tr '\n' ' ')"
 assert_eq "exactly the announced windows became frozen" "$FROZEN_NOW" "$ANNOUNCED"
+# ...and the count agrees at the pane level too: the sweep froze exactly as many
+# panes as it announced, so a window it never named cannot have lost a pane to it.
+# (work:2 is excluded on both sides — phase B froze it long before this sweep.)
+assert_eq "as many panes are frozen as the sweep announced" \
+  "$(_list | awk -F'\t' '$11=="pane" && $1=="FROZEN" && $2=="work" && $3!=2' | grep -c . | tr -d ' ')" \
+  "$(printf '%s\n' "$RUN" | awk -F'\t' '$1=="FROZE" && $2 ~ /^work:[0-9]+\./' | grep -c . | tr -d ' ')"
 
 echo ""
 echo "=================================================================="

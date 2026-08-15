@@ -26,6 +26,15 @@
 
 set -uo pipefail
 
+# ── RESURRECT SAVE-SIDE ISOLATION ────────────────────────────────────────────
+# RESURRECT_FILE redirects resurrect READS. Only @resurrect-dir redirects its
+# WRITES. A test that triggers a save without setting it deposits fixture
+# snapshots in the user's live resurrect directory and can leave `last`
+# pointing at one. See tests/lib/resurrect_guard.sh for the measured damage.
+. "$(cd "$(dirname "$0")" && pwd)/lib/resurrect_guard.sh" || {
+  echo "ABORT: tests/lib/resurrect_guard.sh is missing"; exit 1; }
+cc_register_test_session _seed work legacy alpha beta lvl cA cB cC cD cE
+
 SOCKET="tctest$$"
 TMPROOT="/tmp/tctest-$$"
 PANES_DIR="$TMPROOT/panes"
@@ -59,7 +68,10 @@ cleanup() {
   done
   rm -rf "$TMPROOT"
 }
-trap cleanup EXIT
+# Re-wrap the teardown so a leak into the real resurrect dir fails the run
+# even on the early-abort paths that never reach the final assertions.
+_cc_teardown_guarded() { cleanup; cc_warn_on_resurrect_leak || exit 1; }
+trap _cc_teardown_guarded EXIT
 
 # ── Assertions (all operate on the restore log unless noted) ──────────────────
 _log() { cat "$LOG_FILE" 2>/dev/null; }
@@ -106,6 +118,10 @@ _fresh_server() {
   _t set-option -g @claude-continuity-pending-dir  "$PENDING_DIR"
   _t set-option -g @claude-continuity-log-file     "$LOG_FILE"
   _t set-option -g @resurrect-dir                  "$RESURRECT_DIR"
+  # Pre-flight: ask the SERVER what it will actually use and refuse to run if
+  # the answer is the user's real directory. A set-option that ran too early or
+  # at the wrong scope leaves the default in place, and only asking catches it.
+  cc_guard_resurrect_dir "$RESURRECT_DIR" tmux -L "$SOCKET" -f /dev/null
 }
 
 # Emit a snapshot pane row from the Nth live pane's REAL (window,pane,cwd,title)

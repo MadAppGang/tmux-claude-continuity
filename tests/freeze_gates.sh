@@ -45,6 +45,15 @@
 
 set -uo pipefail
 
+# ── RESURRECT SAVE-SIDE ISOLATION ────────────────────────────────────────────
+# RESURRECT_FILE redirects resurrect READS. Only @resurrect-dir redirects its
+# WRITES. A test that triggers a save without setting it deposits fixture
+# snapshots in the user's live resurrect directory and can leave `last`
+# pointing at one. See tests/lib/resurrect_guard.sh for the measured damage.
+. "$(cd "$(dirname "$0")" && pwd)/lib/resurrect_guard.sh" || {
+  echo "ABORT: tests/lib/resurrect_guard.sh is missing"; exit 1; }
+cc_register_test_session _seed work legacy alpha beta lvl cA cB cC cD cE
+
 SOCKET="ccgt$$"
 TD="/tmp/ccgt-$$"
 FD="$TD/frozen"
@@ -98,7 +107,10 @@ _kill_fixtures() {
   done < "$TD/ps.exit"
 }
 _teardown() { _t kill-server 2>/dev/null; _kill_fixtures; rm -rf "$TD"; }
-trap _teardown EXIT INT TERM
+# Re-wrap the teardown so a leak into the real resurrect dir fails the run
+# even on the early-abort paths that never reach the final assertions.
+_cc_teardown_guarded() { _teardown; cc_warn_on_resurrect_leak || exit 1; }
+trap _cc_teardown_guarded EXIT INT TERM
 
 mkdir -p "$FD" "$PD/by-pid" "$LD" "$QD" "$RD" "$BIN" "$FIX"
 
@@ -140,6 +152,10 @@ _t set-option -g @claude-continuity-claude-cmd   "echo" >/dev/null
 _t set-option -g @claude-continuity-claudish-cmd "claudish" >/dev/null
 _t set-option -g @claude-continuity-freeze-dir   "$FD" >/dev/null
 _t set-option -g @resurrect-dir                  "$RD" >/dev/null
+# Pre-flight: ask the SERVER what it will actually use and refuse to run if
+# the answer is the user's real directory. A set-option that ran too early or
+# at the wrong scope leaves the default in place, and only asking catches it.
+cc_guard_resurrect_dir "$RD" tmux -L "$SOCKET" -f /dev/null
 
 # work:1..8 hold injected worlds (one parked shell each);
 # work:9..10 hold REAL claude trees for the stale-capture case;
@@ -183,10 +199,18 @@ _list_alive() { local p; while IFS= read -r p; do [ -z "$p" ] && continue
 _pane_pid() { _t list-panes -t "$1" -F '#{pane_pid}' | head -1; }
 _pane_count() { _t list-panes -t "$1" 2>/dev/null | wc -l | tr -d ' '; }
 _frozen_opt() { _t show-options -w -t "$1" -v @cc-frozen 2>/dev/null || true; }
+# THE ATOM IS A PANE: the claim moved from the window option to the PANE option,
+# so a claim assertion made with -w now passes vacuously on every implementation.
+_pane_frozen_opt() { _t show-options -p -t "$1" -v @cc-frozen 2>/dev/null || true; }
 _state_count() { ls "$FD"/*/*.state 2>/dev/null | wc -l | tr -d ' '; }
 _state_path() { ls "$FD"/*/"$1.state" 2>/dev/null | head -1; }
 _field() { printf '%s\n' "$1" | awk -F'\t' -v n="$2" 'NF>=2 { print $n; exit }'; }
 _titles() { _t list-panes -t "$1" -F '#{pane_title}' 2>/dev/null | tr '\n' '|'; }
+# stdout is one row per PANE, plus container summary rows (WINDOW / SESSION).
+_pane_rows() { printf '%s\n' "$1" | awk -F'\t' 'NF>=2 && $1!="WINDOW" && $1!="SESSION"'; }
+_row_for()   { printf '%s\n' "$1" | awk -F'\t' -v t="$2" 'NF>=2 && $2==t { print; exit }'; }
+_verbs()     { _pane_rows "$1" | awk -F'\t' '{print $1}' | sort | tr '\n' ' '; }
+_keys_of()   { _pane_rows "$1" | awk -F'\t' '$3!="-" {print $3}' | sort | tr '\n' ' '; }
 
 _freeze() { # runs against REAL processes
   CC_TEST=1 TMUX_CMD="$TMUX_CMD_STR" CC_FREEZE_DIR="$FD" CC_LOG_FILE="$LOG" \
@@ -495,45 +519,66 @@ echo "[5a] CC_FAIL_AFTER=persist: state is durable BEFORE anything is killed"
 OUT="$(CC_FAIL_AFTER=persist _freeze freeze --no-save work:10 2>/dev/null)"; RC=$?
 printf '    exit=%s stdout=[%s]\n' "$RC" "$OUT"
 _state_scalar() { awk -F'\t' -v k="$2" '$1==k { print $2; exit }' "$1" 2>/dev/null; }
-HALF="$(ls -t "$FD"/*/*.state 2>/dev/null | head -1)"
-if [ -n "$HALF" ] && [ -s "$HALF" ] && [ "$(_state_scalar "$HALF" window_index)" = "10" ]; then
-  ok "the capture is on disk after the injected failure"
+# The atom is a pane, so a 2-pane window leaves TWO half-states, one per pane.
+HALF_KEYS="$TD/half_keys"; : > "$HALF_KEYS"
+for f in "$FD"/*/*.state; do
+  [ -f "$f" ] || continue
+  [ "$(_state_scalar "$f" window_index)" = "10" ] || continue
+  printf '%s\n' "$(_state_scalar "$f" key)" >> "$HALF_KEYS"
+done
+sort -o "$HALF_KEYS" "$HALF_KEYS"
+if [ "$(_count_lines "$HALF_KEYS")" = "2" ]; then
+  ok "both captures are on disk after the injected failure"
 else
-  HALF=""
-  no "the capture is on disk after the injected failure" \
-     "no state file for window 10 — the write-ahead ordering is not observable"
+  no "both captures are on disk after the injected failure" \
+     "found $(_count_lines "$HALF_KEYS") state file(s) for window 10 — the write-ahead ordering is not observable"
 fi
 assert_eq "NOTHING was killed (every w10 pid still alive)" \
   "$(_count_alive "$TD/t10")" "$(_count_lines "$TD/t10")"
 assert_eq "the window still has both panes" "$(_pane_count work:10)" "2"
 # §3.1.1's resume-from-kill branch can only exist if the half-state is CLAIMED:
-# a state file is inert until a live window carries its key (§7, @cc-frozen).
-# Without this, the next invocation can only re-capture, and the stale-capture
-# re-verification below is unreachable.
-if [ -n "$HALF" ]; then
-  assert_eq "the half-state is claimed by the window, so it can be resumed" \
-    "$(_frozen_opt work:10)" "$(_state_scalar "$HALF" key)"
-fi
+# a state entry is inert until something live carries its key (§7, @cc-frozen).
+# Under the pane atom that claim is a PANE option, and each entry must be claimed
+# by the pane it captured — not by the window, and not by a sibling.
+BADCLAIM=0
+while IFS= read -r k; do
+  [ -z "$k" ] && continue
+  sf="$(_state_path "$k")"
+  p="$(_state_scalar "$sf" pane_id)"
+  if [ -z "$p" ] || [ "$(_pane_frozen_opt "$p")" != "$k" ]; then
+    BADCLAIM=$((BADCLAIM+1))
+    echo "        entry $k names pane [$p] whose claim is [$(_pane_frozen_opt "${p:-%none}")]"
+  fi
+done < "$HALF_KEYS"
+assert_eq "every half-state is claimed by the PANE it captured, so it can be resumed" "$BADCLAIM" "0"
 
 # 5b — POSITIVE CONTROL: with the world unchanged, the resume completes.
 echo ""
 echo "[5b] POSITIVE CONTROL: unchanged world -> the freeze resumes from the kill step"
-HALF_KEY=""; [ -n "$HALF" ] && HALF_KEY="$(_state_scalar "$HALF" key)"
 STATES_BEFORE_RESUME="$(_state_count)"
+LAYOUT10_BEFORE="$(_t display-message -p -t work:10 '#{window_layout}')"
 OUT="$(_freeze freeze --no-save work:10 2>/dev/null)"; RC=$?
 printf '    exit=%s stdout=[%s]\n' "$RC" "$OUT"
-assert_eq "verb is FROZE (not stale-capture)" "$(_field "$OUT" 1)" "FROZE"
+assert_eq "every pane reports FROZE (not stale-capture)" "$(_verbs "$OUT")" "FROZE FROZE "
 assert_eq "exit code 0"                       "$RC" "0"
-assert_eq "the window collapsed to 1 pane"    "$(_pane_count work:10)" "1"
-# "FROZE" alone cannot tell a RESUME from a fresh re-capture — both collapse the
-# window and both say FROZE. The mechanism is the key: §3.1.1's branch resumes
+# The pane atom never restructures a window: the freeze respawns each pane in
+# place, so the pane count and the layout are unchanged and every pane is a
+# tombstone. "Collapsed to 1 pane" was the window model and would now mean the
+# freeze destroyed a pane.
+assert_eq "the window was NOT restructured — both panes remain" "$(_pane_count work:10)" "2"
+assert_eq "its layout is byte-identical"      "$(_t display-message -p -t work:10 '#{window_layout}')" "$LAYOUT10_BEFORE"
+assert_eq "both panes are tombstones" \
+  "$(_t list-panes -t work:10 -F '#{pane_title}' | grep -vc "^$(printf '\xe2\x9d\x84') FROZEN " | tr -d ' ')" "0"
+# "FROZE" alone cannot tell a RESUME from a fresh re-capture — both end in a
+# tombstone and both say FROZE. The mechanism is the key: §3.1.1's branch resumes
 # "using the persisted capture", so it must reuse that capture's key. A new key
 # means the half-state was abandoned, not resumed, and the persisted capture —
 # which holds session ids and which §9 never garbage-collects — is orphaned in
 # the store, where D1 makes it inert forever.
-if [ -n "$HALF_KEY" ]; then
-  assert_eq "the resume reused the PERSISTED capture's key" "$(_field "$OUT" 3)" "$HALF_KEY"
-  assert_eq "no second state file was minted for the same window" \
+if [ "$(_count_lines "$HALF_KEYS")" = "2" ]; then
+  assert_eq "the resume reused the PERSISTED captures' keys, both of them" \
+    "$(_keys_of "$OUT")" "$(tr '\n' ' ' < "$HALF_KEYS")"
+  assert_eq "no second state file was minted for either pane" \
     "$(_state_count)" "$STATES_BEFORE_RESUME"
 fi
 for _w in 1 2 3 4 5 6 7 8 9 10; do
@@ -545,18 +590,41 @@ assert_eq "every captured w10 pid is dead" "$(_count_alive "$TD/t10")" "0"
 # 5c — the abort: mutate the world between capture and kill.
 echo ""
 echo "[5c] MUTATED WORLD: a recorded pid disappears -> REFUSED stale-capture"
+_tree_of_pane() { # <pane id> <outfile>: that pane's pid AND every descendant
+  local pp; pp="$(_t display-message -p -t "$1" '#{pane_pid}' 2>/dev/null)"
+  : > "$2"; [ -z "$pp" ] && return 0
+  printf '%s\n' "$pp" >> "$2"; _descendants "$pp" >> "$2"
+  sort -u "$2" -o "$2"
+}
+# Stale-capture is decided PER PANE now — the re-verification compares each
+# pane's own captured set against its own fresh descendant set — so the intruder
+# is planted in one named pane and the assertions are made about THAT pane. Its
+# sibling's capture is untouched and freezing it is the correct outcome, not a
+# leak: asserting "nothing in the window was killed" would now be asserting a bug.
+STALE_PANE="$(_t list-panes -t work:9 -F '#{pane_id}' | tail -1)"
+CLEAN_PANE="$(_t list-panes -t work:9 -F '#{pane_id}' | head -1)"
+_tree_of_pane "$STALE_PANE" "$TD/t9_stale"
+_tree_of_pane "$CLEAN_PANE" "$TD/t9_clean"
+
 OUT="$(CC_FAIL_AFTER=persist _freeze freeze --no-save work:9 2>/dev/null)"; RC=$?
 printf '    persist exit=%s stdout=[%s]\n' "$RC" "$OUT"
-SF9="$(ls -t "$FD"/*/*.state 2>/dev/null | head -1)"
-if [ -n "$SF9" ] && [ "$(_state_scalar "$SF9" window_index)" = "9" ]; then
-  ok "w9's capture is on disk"
+SF9=""
+for f in "$FD"/*/*.state; do
+  [ -f "$f" ] || continue
+  [ "$(_state_scalar "$f" window_index)" = "9" ] || continue
+  [ "$(_state_scalar "$f" pane_id)" = "$STALE_PANE" ] || continue
+  SF9="$f"
+done
+if [ -n "$SF9" ]; then
+  ok "the capture of the pane we are about to make stale is on disk"
 else
-  SF9=""
-  no "w9's capture is on disk" "no state file for window 9"
+  no "the capture of the pane we are about to make stale is on disk" \
+     "no state entry naming $STALE_PANE"
 fi
 assert_eq "still nothing killed" "$(_count_alive "$TD/t9")" "$(_count_lines "$TD/t9")"
 
 if [ -n "$SF9" ]; then
+  STALE_KEY="$(_state_scalar "$SF9" key)"
   STATES_BEFORE="$(_state_count)"
   # Make the capture stale WITHOUT killing anything: fork one new process inside
   # a pane, so the fresh descendant set of a pane pid now contains a pid that was
@@ -567,7 +635,7 @@ if [ -n "$SF9" ]; then
   # verdict wearing stale-capture's name. A shell is unambiguously SAFE, which
   # leaves "a pid appeared that was not in the captured set" as the only
   # available reason to refuse.
-  SH_PANE="$(_t list-panes -t work:9 -F '#{pane_id}' | tail -1)"
+  SH_PANE="$STALE_PANE"
   _t send-keys -t "$SH_PANE" '/bin/sh -i' Enter
   INTRUDER=""
   for _w in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
@@ -586,16 +654,27 @@ if [ -n "$SF9" ]; then
 
   OUT="$(_freeze freeze --no-save work:9 2>/dev/null)"; RC=$?
   printf '    resume  exit=%s stdout=[%s]\n' "$RC" "$OUT"
-  assert_eq "verb is REFUSED"               "$(_field "$OUT" 1)" "REFUSED"
-  assert_eq "reason is stale-capture"       "$(_field "$OUT" 6)" "stale-capture"
-  assert_eq "exit code 3"                   "$RC" "3"
-  assert_eq "the stale state file was deleted" "$(_state_count)" "$((STATES_BEFORE - 1))"
-  assert_eq "NOTHING was killed: every original pid is still alive" \
-    "$(_count_alive "$TD/t9")" "$(_count_lines "$TD/t9")"
+  STALE_ROW="$(_row_for "$OUT" "work:9.$(_t display-message -p -t "$STALE_PANE" '#{pane_index}')")"
+  CLEAN_ROW="$(_row_for "$OUT" "work:9.$(_t display-message -p -t "$CLEAN_PANE" '#{pane_index}')")"
+  assert_eq "the stale pane's verb is REFUSED"   "$(_field "$STALE_ROW" 1)" "REFUSED"
+  assert_eq "its reason is stale-capture"        "$(_field "$STALE_ROW" 6)" "stale-capture"
+  assert_eq "a refused pane is given no key"     "$(_field "$STALE_ROW" 3)" "-"
+  # The sibling's captured set is unchanged, so it is not stale and freezing it is
+  # correct. Asserting otherwise would demand that one pane's intruder veto another
+  # pane's freeze, which is the window model reappearing under a new name.
+  assert_eq "its untouched sibling still freezes" "$(_field "$CLEAN_ROW" 1)" "FROZE"
+  assert_ne "the refusal is not reported as success" "$RC" "0"
+  assert_eq "the stale entry was deleted"        "$(_state_path "$STALE_KEY")" ""
+  assert_eq "one entry fewer in the store"       "$(_state_count)" "$((STATES_BEFORE - 1))"
+  assert_eq "NOTHING in the stale pane was killed: every original pid is still alive" \
+    "$(_count_alive "$TD/t9_stale")" "$(_count_lines "$TD/t9_stale")"
   assert_eq "the intruder was not killed either" \
     "$(kill -0 "${INTRUDER:-999999}" 2>/dev/null && echo alive || echo dead)" "alive"
   assert_eq "the window still has both panes" "$(_pane_count work:9)" "2"
-  assert_eq "no @cc-frozen claim was left behind" "$(_frozen_opt work:9)" ""
+  assert_eq "the refused pane carries no @cc-frozen claim" "$(_pane_frozen_opt "$STALE_PANE")" ""
+  assert_hasnt "and it wears no tombstone title" \
+    "$(_t display-message -p -t "$STALE_PANE" '#{pane_title}')" "$(printf '\xe2\x9d\x84') FROZEN"
+  assert_ne "the pane that DID freeze claims its key" "$(_pane_frozen_opt "$CLEAN_PANE")" ""
 fi
 
 # ── G6: a tombstone title with no verified state file ────────────────────────
@@ -604,8 +683,11 @@ echo "[6] G6: a ❄ title with no verified state file -> FAILED, exit 2, nothing
 _tree_of_window work:11 "$TD/t11"
 assert_eq "every w11 pid is ALIVE before" "$(_count_alive "$TD/t11")" "$(_count_lines "$TD/t11")"
 ORPHAN_PANE="$(_t list-panes -t work:11 -F '#{pane_id}' | head -1)"
-_t select-pane -t "$ORPHAN_PANE" -T "$(printf '\xe2\x9d\x84 FROZEN 1700000000-nostat 2p/1s 2026-01-01')"
-_t set-option -w -t work:11 @cc-frozen "1700000000-nostat"
+ORPHAN_PID_BEFORE="$(_t display-message -p -t "$ORPHAN_PANE" '#{pane_pid}')"
+_t select-pane -t "$ORPHAN_PANE" -T "$(printf '\xe2\x9d\x84 FROZEN 1700000000-nostat 1p/1s 2026-01-01')"
+# The claim is a PANE option under the pane atom; a `-w` claim would be the
+# legacy shape and would test the migration path, not this gate.
+_t set-option -p -t "$ORPHAN_PANE" @cc-frozen "1700000000-nostat"
 STATES_BEFORE="$(_state_count)"
 OUT="$(_freeze freeze --no-save work:11 2>/dev/null)"; RC=$?
 printf '    exit=%s stdout=[%s]\n' "$RC" "$OUT"
@@ -613,6 +695,8 @@ assert_eq "verb is FAILED"                 "$(_field "$OUT" 1)" "FAILED"
 assert_eq "exit code 2"                    "$RC" "2"
 assert_eq "NOTHING was killed"             "$(_count_alive "$TD/t11")" "$(_count_lines "$TD/t11")"
 assert_eq "the window is left exactly as found" "$(_pane_count work:11)" "1"
+assert_eq "the pane was not even respawned" \
+  "$(_t display-message -p -t "$ORPHAN_PANE" '#{pane_pid}')" "$ORPHAN_PID_BEFORE"
 assert_eq "no state file was invented"     "$(_state_count)" "$STATES_BEFORE"
 # §3.1.1 requires the half-state to be logged; it does not say WHERE, and
 # §3.1.12's `<log>-freeze.log` is a side effect of a freeze that HAPPENED. This

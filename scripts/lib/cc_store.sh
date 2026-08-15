@@ -68,6 +68,29 @@ cc_store_scalar() {
   awk -F'\t' -v k="$2" '$1 == k { print $2; exit }' "$1" 2>/dev/null
 }
 
+# ── The entry TYPE, and the only backwards-compatibility rule in this file ───
+# An entry describes either ONE PANE (`unit<TAB>pane`, everything written since
+# the atom became the pane) or ONE WINDOW that was collapsed into a single
+# tombstone (`unit` absent — every entry written by a97bff0 and earlier).
+#
+# The distinction is read off the FILE, never inferred from where the claim
+# happens to live: a legacy entry re-claimed by post_restore.sh, a pane entry
+# whose claim rode a window option across a reboot, and a fresh pane entry all
+# have to be told apart correctly, and only the file knows.
+#
+# Legacy entries are never migrated in place — a rewrite is a write to the only
+# record of somebody's session ids, and there is nothing to gain by it. They are
+# read as they are and thawed by the legacy path in cc_thaw.sh, which is the
+# unmodified window rebuild (splits + select-layout).
+cc_store_unit() {
+  local u
+  u="$(cc_store_scalar "$1" unit)"
+  case "$u" in
+    pane) printf 'pane' ;;
+    *)    printf 'window' ;;
+  esac
+}
+
 # Every sid recorded for the window, optionally filtered by ;ROLE=.
 cc_store_sids() {
   local f="$1" role="${2:-}" line v r
@@ -224,7 +247,7 @@ _cc_human_date() {
 # Rendered once, at freeze, from the state file. The tombstone pane `cat`s this
 # file; there is no <key>.screen sidecar to garbage-collect (internal M-f).
 cc_store_banner_render() {
-  local f="$1" key sess name idx panes sids sec frozen idle cwd rss
+  local f="$1" key sess name idx panes sids sec frozen idle cwd rss unit pidx
   key="$(cc_store_scalar "$f" key)"
   sess="$(_cc_unb64 "$(cc_store_scalar "$f" session)")"
   name="$(_cc_unb64 "$(cc_store_scalar "$f" window_name)")"
@@ -236,19 +259,138 @@ cc_store_banner_render() {
   idle="$(_cc_human_dur "$(cc_store_scalar "$f" idle_at_freeze)")"
   cwd="$(_cc_unb64 "$(cc_store_scalar "$f" primary_cwd)")"
   rss="$(_cc_human_size "$(cc_store_scalar "$f" rss_at_freeze)")"
+  unit="$(cc_store_unit "$f")"
+  pidx="$(cc_store_scalar "$f" pane_index)"
   printf '\n'
-  printf '  ❄  FROZEN WINDOW  ·  %s:%s  "%s"\n\n' "$sess" "$idx" "$name"
+  if [ "$unit" = "pane" ]; then
+    printf '  ❄  FROZEN PANE  ·  %s:%s.%s  "%s"\n\n' "$sess" "$idx" "${pidx:-?}" "$name"
+  else
+    printf '  ❄  FROZEN WINDOW  ·  %s:%s  "%s"\n\n' "$sess" "$idx" "$name"
+  fi
   printf '     frozen         %s\n' "$frozen"
   printf '     idle at freeze %s\n' "$idle"
   printf '     panes          %-8s claude sessions  %s   (%s not auto-resumed)\n' "$panes" "$sids" "$sec"
-  printf '     primary cwd    %s\n' "$cwd"
+  if [ "$unit" = "pane" ]; then printf '     pane cwd       %s\n' "$cwd"
+  else                          printf '     primary cwd    %s\n' "$cwd"; fi
   printf '     memory freed   ~%s  (approximate: shared pages counted once per process)\n\n' "$rss"
   printf '     wake:  prefix + Z  →  select  →  Ctrl-W\n'
   printf '     or:    %s/cc_thaw.sh thaw %s\n\n' "$(cd "$_CC_STORE_DIR/.." && pwd)" "$key"
 }
 
 # ── The ledger (§2.5) ────────────────────────────────────────────────────────
+#
+# TWO FIELDS, AND ONLY ONE OF THEM ANSWERS "HOW IDLE IS THIS WINDOW".
+#
+#   ;LAST=  the best estimate of WHEN THE WINDOW WAS LAST ACTIVE, as an epoch.
+#           This is the AUTHORITATIVE idle field. Every consumer — the popup's
+#           idle column, the sweep's ledger rail, `idle_at_freeze` — reads this
+#           and nothing else.
+#   ;SEEN=  the raw `#{window_activity}` value AS OBSERVED at the last look. It
+#           is a CHANGE DETECTOR (and the source ;LAST= is seeded from), never
+#           an answer: tmux resets it for every window when the server restarts,
+#           which is the entire reason ;LAST= has to exist and be carried over.
+#
+# The bug this comment exists to prevent, because it shipped and it silently
+# disabled the feature: the seed used to write `;LAST=<the seed clock>` while
+# writing the window's true `#{window_activity}` into `;SEEN=`. Every window
+# then read as "idle since the ledger was created" — on the user's machine, 46
+# rows clamped to a uniform 13 h when tmux itself reported ages up to 100 h, and
+# 18 genuinely-idle-for-days windows counted as 0 candidates. It looked like it
+# worked (plausible numbers, no error) and auto-freeze could not fire until the
+# LEDGER FILE was older than the threshold.
+#
+# The rule, in one line: **;LAST= is only ever set from an OBSERVATION** — a
+# `#{window_activity}` value, a carried-over ;LAST=, or the moment a change was
+# detected. It is never set from "the clock when this file happened to be
+# written", and `cc_ledger_heal` repairs any row where it was.
+#
+# ── WHICH SOURCE IS AUTHORITATIVE, AND WHEN ─────────────────────────────────
+# Two observations can answer "when was this window last active", and they
+# disagree in exactly one situation, so the choice is stated once here and every
+# writer below implements THIS rule and nothing else:
+#
+#   REGIME 1 — a row this generation has never seen before (a fresh ledger, or a
+#     window the carry-over could not match).  `#{window_activity}` IS the
+#     answer.  tmux has been tracking that window the whole time and its value
+#     is a real observation, so a window tmux says was last active 100 h ago
+#     seeds as 100 h idle — never as "idle since this file was written".
+#
+#   REGIME 2 — a row carried across a GENERATION CHANGE (a new tmux server; a
+#     seed only ever runs when `gen` no longer matches the live server pid).
+#     The CARRIED-OVER ;LAST= is the answer, outright.  The new server stamped
+#     `#{window_activity}` with the RESTORE MOMENT for every window it rebuilt,
+#     uniformly, so that column contains no information about this window's
+#     history at all; the previous generation's ;LAST= is the only surviving
+#     record of it (FR3.2/AC13).  Preferring the live value here is precisely
+#     the "a reboot makes everything look freshly used" bug.
+#
+#   REGIME 3 — a tick within one generation.  `#{window_activity}` is a CHANGE
+#     DETECTOR only: ;LAST= moves forward when ;SEEN= changes (to the observed
+#     activity value, not to the tick clock) and never moves backwards.
+#
+# Regime 2 is safe to state that strongly only BECAUSE `cc_ledger_heal` runs
+# first: heal is what guarantees a carried ;LAST= is an observation and not a
+# clock stamp (or a future epoch from a stepped clock), so "carried wins" can
+# never propagate the bug described above into the new generation.
+#
+# The rule is deliberately independent of WHEN anything is read.  ;LAST= is a
+# fixed epoch on disk that only an observation moves; a read one second after a
+# seed and a read an hour after it return the same value, and no consumer needs
+# to know how long ago the ledger was written.
 cc_ledger_path() { printf '%s/ledger' "$(cc_store_ns_dir)"; }
+
+# Repair rows whose ;LAST= was stamped by a clock rather than by an observation.
+#
+#   a row is healed  ⇔  ;SEEN= is OLDER than ;LAST=
+#   then             →  ;LAST= := ;SEEN=
+#
+# That predicate is exact, not heuristic, because ;LAST= is DERIVED from ;SEEN=
+# by every writer in this file: the seed takes the window's activity, the tick
+# takes the activity value that changed, and the touch writes both at once. A
+# ;LAST= newer than the activity it is supposed to describe can therefore only
+# have come from a clock — which is the bug: the old seed wrote
+# `;LAST=<the seed clock>` beside the true `;SEEN=`, so 46 rows on this machine
+# read as a uniform 13 h idle while tmux reported up to 100 h.
+#
+# A row whose ;SEEN= is NEWER than (or equal to) its ;LAST= is left exactly
+# alone: that is a genuine observation — a real touch (a thaw writes both fields
+# together for precisely this reason) or a normal tick — and a real signal must
+# always win over a repair. Idempotent: healing a healed ledger is a no-op.
+#
+# Deliberately NOT gated on the `gen` timestamp: the tick rewrites `gen` with
+# the CURRENT clock on every pass, so on a real ledger it is minutes old while
+# the mis-stamped ;LAST= is hours old, and a "LAST >= gen" test heals nothing at
+# all. Measured against the live ledger before this predicate was chosen.
+cc_ledger_heal() {
+  local led tmp n
+  led="$(cc_ledger_path)"
+  [ -f "$led" ] || return 0
+  tmp="$(cc_store_ns_dir)/tmp/heal.$$"
+  awk -F'\t' 'BEGIN { OFS = "\t" }
+    $1 == "w" {
+      last = ""; seen = ""; li = 0; si = 0
+      for (i = 2; i <= NF; i++) {
+        if      (substr($i, 1, 6) == ";LAST=") { last = substr($i, 7); li = i }
+        else if (substr($i, 1, 6) == ";SEEN=") { seen = substr($i, 7); si = i }
+      }
+      if (li && si && last ~ /^[0-9]+$/ && seen ~ /^[0-9]+$/ && (seen + 0) < (last + 0)) {
+        $li = ";LAST=" seen
+        healed++
+      }
+      print
+      next
+    }
+    { print }
+    END { printf "%d\n", healed + 0 > "/dev/stderr" }
+  ' "$led" > "$tmp" 2>"$tmp.n"
+  [ -s "$tmp" ] || { rm -f "$tmp" "$tmp.n"; return 0; }
+  n="$(head -n 1 "$tmp.n" 2>/dev/null)"
+  case "${n:-0}" in ''|0) rm -f "$tmp" "$tmp.n"; return 0 ;; esac
+  _cc_atomic_write "$led" < "$tmp"
+  rm -f "$tmp" "$tmp.n"
+  _cc_log "LEDGER-HEAL $n row(s): ;LAST= was a seed/tick clock stamp while ;SEEN= held older real activity"
+  return 0
+}
 
 # One tmux call, then two base64 forks per window. Deliberate: an awk base64
 # implementation would be a fourth format to get wrong, and this rides a
@@ -270,14 +412,21 @@ _cc_ledger_live_table() {
 # discards every activity signal from exactly the period when the user
 # re-engages with the windows they care about (internal C8a).
 # Carry-over is by exact (session, window_name, ordinal-within-session); a row
-# that does not match exactly one live window is DROPPED, which reads as
-# "active as of the seed" — the safe direction.
+# that does not match exactly one live window is DROPPED, which falls back to
+# the window's own `#{window_activity}` — never to the seed clock (see the
+# ;LAST=/;SEEN= note above; seeding from the clock is the bug that made every
+# window read as "idle since this file was written").
+# A seed is by definition a GENERATION CHANGE, so it is where regimes 1 and 2 of
+# the authoritative-source rule meet: matched → the carried ;LAST= wins, not
+# matched → the window's own `#{window_activity}` wins.
 cc_ledger_seed() {
   local led live prev now gen
   led="$(cc_ledger_path)"
   live="$(cc_store_ns_dir)/tmp/live.$$"
   prev="$(cc_store_ns_dir)/tmp/prev.$$"
   now="$(_cc_now)"; gen="$(_cc_server_pid)"
+  # Carry-over must not propagate a clock stamp from the previous generation.
+  cc_ledger_heal
   _cc_ledger_live_table > "$live" 2>/dev/null
   if [ -f "$led" ]; then cp "$led" "$prev" 2>/dev/null; else : > "$prev"; fi
   awk -F'\t' -v now="$now" -v gen="$gen" -v livef="$live" '
@@ -302,8 +451,22 @@ cc_ledger_seed() {
       printf "v\t1\n"
       printf "gen\t%s\t%s\n", gen, now
       for (i = 1; i <= ln; i++) {
-        lv = now
-        if (lkey[i] in prev && prev[lkey[i]] ~ /^[0-9]+$/) lv = prev[lkey[i]]
+        # REGIME 1 — no carried row: the window`s OWN activity is the baseline,
+        # never the seed clock, so a window tmux says was last active 100 h ago
+        # seeds as 100 h idle.
+        lv = (lact[i] ~ /^[0-9]+$/) ? lact[i] : now
+        # REGIME 2 — a carried row: it WINS OUTRIGHT. The new server stamped
+        # #{window_activity} with the restore moment for every window it
+        # rebuilt, so lact carries no history here and the previous
+        # generation`s ;LAST= is the only record of it (FR3.2/AC13). This is
+        # not "whichever is older": a `cc_ledger_touch` from a thaw is a real
+        # observation that legitimately reads NEWER than the activity column,
+        # and min() would silently roll it back to the restore stamp.
+        # `cc_ledger_heal` above is what makes this safe — it has already
+        # reduced any clock-stamped or future ;LAST= to the ;SEEN= it claims to
+        # describe, so nothing unobserved can be carried forward.
+        if (lkey[i] in prev && prev[lkey[i]] ~ /^[0-9]+$/)
+          lv = prev[lkey[i]] + 0
         printf "w\t;ID=%s\t;S=%s\t;I=%s\t;N=%s\t;LAST=%s\t;SEEN=%s\n",
                lid[i], ls[i], lidx[i], lnm[i], lv, lact[i]
       }
@@ -325,6 +488,10 @@ cc_ledger_tick() {
   # A server that starts without a restore seeds on its first tick; its windows
   # are new anyway.
   if [ ! -f "$led" ] || [ "$gen" != "$cur" ]; then cc_ledger_seed; return 0; fi
+  # Repair any row a previous version stamped with the seed clock. Runs before
+  # the delta pass so the carried-forward ;LAST= is the healed one, and it is a
+  # no-op on a ledger that is already correct.
+  cc_ledger_heal
   live="$(cc_store_ns_dir)/tmp/live.$$"
   now="$(_cc_now)"
   _cc_ledger_live_table > "$live" 2>/dev/null
@@ -348,10 +515,21 @@ cc_ledger_tick() {
       printf "gen\t%s\t%s\n", gen, now
       for (i = 1; i <= ln; i++) {
         id = lid[i]
+        # REGIME 3 — same generation. ;LAST= is only ever set from an
+        # OBSERVATION (see the header note): when the change detector fires,
+        # the activity value ITSELF is the answer, not the moment this pass
+        # happened to notice it. A window with no row yet is regime 1 — it
+        # baselines on its own activity, never on the clock.
+        obs = (lact[i] ~ /^[0-9]+$/ && (lact[i] + 0) <= (now + 0)) ? lact[i] : now
         if (id in plast && plast[id] ~ /^[0-9]+$/) {
           last = plast[id]; seen = pseen[id]
-          if (lact[i] != seen) { last = now; seen = lact[i] }
-        } else { last = now; seen = lact[i] }
+          # A tick never moves ;LAST= BACKWARDS. `cc_ledger_touch` (a thaw) sets
+          # it to now while #{window_activity} may still read a few seconds
+          # earlier, and pulling it back would quietly undo the one signal that
+          # says "the user is here". The only backwards move in this file is
+          # `cc_ledger_heal`, which is gated on the row being a clock stamp.
+          if (lact[i] != seen) { last = (obs + 0 > last + 0) ? obs : last; seen = lact[i] }
+        } else { last = obs; seen = lact[i] }
         printf "w\t;ID=%s\t;S=%s\t;I=%s\t;N=%s\t;LAST=%s\t;SEEN=%s\n",
                id, ls[i], lidx[i], lnm[i], last, seen
       }
@@ -382,6 +560,13 @@ cc_ledger_last() {
   ' "$led" 2>/dev/null
 }
 
+# A thaw IS activity — the user just woke this window — so it sets ;LAST=. It
+# writes ;SEEN= to the SAME value, and that is not cosmetic: a row whose ;LAST=
+# is newer than its ;SEEN= is exactly the shape `cc_ledger_heal` repairs, so a
+# touch that left ;SEEN= behind would be healed straight back to "idle for days"
+# the next time anything ran. Writing both together says "observed now", which
+# is true — a thaw respawns the pane, and tmux marks the window active — and the
+# next tick's change detector picks the row up normally.
 cc_ledger_touch() {
   local led tmp
   led="$(cc_ledger_path)"
@@ -390,7 +575,13 @@ cc_ledger_touch() {
   awk -F'\t' -v id="$1" -v now="$(_cc_now)" 'BEGIN { OFS = "\t" }
     $1 == "w" {
       for (i = 2; i <= NF; i++) if ($i == ";ID=" id) hit = 1
-      if (hit) { for (i = 2; i <= NF; i++) if ($i ~ /^;LAST=/) $i = ";LAST=" now; hit = 0 }
+      if (hit) {
+        for (i = 2; i <= NF; i++) {
+          if      ($i ~ /^;LAST=/) $i = ";LAST=" now
+          else if ($i ~ /^;SEEN=/) $i = ";SEEN=" now
+        }
+        hit = 0
+      }
     }
     { print }
   ' "$led" > "$tmp" 2>/dev/null
@@ -466,13 +657,17 @@ _cc_store_main() {
       local b; b="$(cc_store_path "$1")"
       cc_store_verify "$b" || return 2
       cc_store_banner_render "$b" ;;
+    unit)   [ -n "${1:-}" ] || return 1
+            local uf="$1"; [ -f "$uf" ] || uf="$(cc_store_path "$1")"
+            cc_store_unit "$uf"; printf '\n' ;;
     ledger)
       case "${1:-}" in
         seed) cc_ledger_seed ;;
         tick) cc_ledger_tick ;;
+        heal) cc_ledger_heal ;;
         last) cc_ledger_last "${2:-}"; printf '\n' ;;
         touch) cc_ledger_touch "${2:-}" ;;
-        *) printf 'usage: cc_store.sh ledger seed|tick|last <window_id>|touch <window_id>\n' >&2; return 1 ;;
+        *) printf 'usage: cc_store.sh ledger seed|tick|heal|last <window_id>|touch <window_id>\n' >&2; return 1 ;;
       esac ;;
     pin)
       case "${1:-}" in
@@ -483,7 +678,7 @@ _cc_store_main() {
         *) printf 'usage: cc_store.sh pin add|rm|is|list [<window_id>]\n' >&2; return 1 ;;
       esac ;;
     *)
-      printf 'usage: cc_store.sh dir|mint|keys|path|verify|scalar|sids|banner|ledger|pin …\n' >&2
+      printf 'usage: cc_store.sh dir|mint|keys|path|verify|scalar|sids|unit|banner|ledger|pin …\n' >&2
       return 1 ;;
   esac
 }

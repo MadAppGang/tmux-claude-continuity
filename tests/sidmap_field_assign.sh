@@ -35,6 +35,15 @@
 
 set -uo pipefail
 
+# ── RESURRECT SAVE-SIDE ISOLATION ────────────────────────────────────────────
+# RESURRECT_FILE redirects resurrect READS. Only @resurrect-dir redirects its
+# WRITES. A test that triggers a save without setting it deposits fixture
+# snapshots in the user's live resurrect directory and can leave `last`
+# pointing at one. See tests/lib/resurrect_guard.sh for the measured damage.
+. "$(cd "$(dirname "$0")" && pwd)/lib/resurrect_guard.sh" || {
+  echo "ABORT: tests/lib/resurrect_guard.sh is missing"; exit 1; }
+cc_register_test_session _seed work legacy alpha beta lvl cA cB cC cD cE
+
 SOCKET="ccsm$$"
 TD="/tmp/ccsm-$$"
 PD="$TD/panes"
@@ -98,7 +107,10 @@ _teardown() {
   _kill_fixtures
   rm -rf "$TD"
 }
-trap _teardown EXIT INT TERM
+# Re-wrap the teardown so a leak into the real resurrect dir fails the run
+# even on the early-abort paths that never reach the final assertions.
+_cc_teardown_guarded() { _teardown; cc_warn_on_resurrect_leak || exit 1; }
+trap _cc_teardown_guarded EXIT INT TERM
 
 mkdir -p "$PD/by-pid" "$LD" "$QD" "$RD" "$BIN" "$FIX" "$SHIM"
 
@@ -139,6 +151,10 @@ _t set-option -g @claude-continuity-log-file    "$LOG" >/dev/null
 _t set-option -g @claude-continuity-claude-cmd  "echo" >/dev/null
 _t set-option -g @claude-continuity-claudish-cmd "claudish" >/dev/null
 _t set-option -g @resurrect-dir                 "$RD" >/dev/null
+# Pre-flight: ask the SERVER what it will actually use and refuse to run if
+# the answer is the user's real directory. A set-option that ran too early or
+# at the wrong scope leaves the default in place, and only asking catches it.
+cc_guard_resurrect_dir "$RD" tmux -L "$SOCKET" -f /dev/null
 
 # A second window whose pane runs claude behind the op wrapper.
 _t new-window -t work -c /tmp "sh -c '\"$BIN/op\" \"$FIX/oprun.sh\"; :'"

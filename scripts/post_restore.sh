@@ -230,7 +230,8 @@ _cc_proc_written=0     # non-Claude programs (@claude-continuity-restore-procs) 
 _cc_skipped_absent=0    # SID rows whose session no longer exists live (benign)
 _cc_skipped_present=0   # SID rows whose session IS live but didn't resolve (real miss)
 _cc_skipped_busy=0      # rows whose pane is already running something (manual restore)
-_cc_frozen_claimed=0    # ❄ tombstone rows re-claimed onto their live window
+_cc_frozen_claimed=0    # ❄ tombstone rows re-claimed onto their live pane
+                        # (onto the window, for a legacy window-unit entry)
 _cc_frozen_warn=0       # frozen anomalies that warrant a boot warning, not a failure
 _cc_claimed_keys="|"    # store keys claimed this run, wrapped in | for substring test
 
@@ -307,12 +308,15 @@ EOF
   return 1
 }
 
-# ── Frozen windows (§3.5 / §4.5) ─────────────────────────────────────────────
-# A frozen window contributes exactly ONE ordinary pane row to the snapshot,
-# whose title is `❄ FROZEN <key> 3p/2s 2026-08-14`. There is no new line type and
-# no new column: the marker rides in a field save.sh already writes and
-# restore.sh already restores verbatim, so a snapshot written by this plugin is
-# an utterly ordinary snapshot to an older one, and vice versa.
+# ── Frozen panes (§3.5 / §4.5) ───────────────────────────────────────────────
+# A frozen PANE contributes an ordinary pane row to the snapshot whose title is
+# `❄ FROZEN <key> 1p/2s 2026-08-14` — one such row per frozen pane, since the
+# atom is the pane and a window freeze is a loop over its panes. (A pre-tree
+# a97bff0 snapshot carries the same shape for a whole collapsed WINDOW; both are
+# handled below, told apart by the entry's own `unit`.) There is no new line type
+# and no new column: the marker rides in a field save.sh already writes and
+# restore.sh already restores verbatim, per pane, so a snapshot written by this
+# plugin is an utterly ordinary snapshot to an older one, and vice versa.
 #
 # The key is the second token of the title. It is minted as <epoch>-<6 hex>, so
 # _cc_is_safe_token is a complete validation of it — and it must be validated,
@@ -338,17 +342,25 @@ _cc_frozen_is_foreign() {
   return 1
 }
 
-# Re-point the two scalars that are only meaningful on the server running NOW.
+# Re-point the scalars that are only meaningful on the server running NOW: the
+# server pid, the window id, and — for a PANE entry — the pane id, because the
+# pane the claim now sits on is a different %N from the one that was frozen.
 # Everything else in the file — the session ids above all — is copied through
 # untouched, and the rewrite goes through the same atomic write the freeze used,
 # so a failure leaves the previous file exactly as it was.
+#
+# An empty pane id is never written: the 4th argument is optional, and when it is
+# absent the pane_id line is copied through like every other line. A `pane_id`
+# scalar with an empty value would be a field this file's readers cannot tell
+# from a missing one.
 _cc_frozen_repoint() {
-  local state="$1" srv="$2" wid="$3" tmpf
+  local state="$1" srv="$2" wid="$3" pid="${4:-}" tmpf
   tmpf="$(dirname "$state")/tmp/reclaim.$$"
   mkdir -p "$(dirname "$tmpf")" 2>/dev/null
-  awk -F'\t' -v sp="$srv" -v wd="$wid" 'BEGIN { OFS = "\t" }
+  awk -F'\t' -v sp="$srv" -v wd="$wid" -v pd="$pid" 'BEGIN { OFS = "\t" }
     $1 == "server_pid" { print $1, sp; next }
     $1 == "window_id"  { print $1, wd; next }
+    $1 == "pane_id" && pd != "" { print $1, pd; next }
     { print }
   ' "$state" > "$tmpf" 2>/dev/null
   if [ ! -s "$tmpf" ] || ! _cc_atomic_write "$state" < "$tmpf"; then
@@ -370,7 +382,7 @@ _cc_frozen_repoint() {
 # Args: session cwd title target
 _cc_frozen_row() {
   local sess="$1" cwd="$2" title="$3" target="$4"
-  local key ns state pane_id wid banner
+  local key ns state pane_id wid banner unit scope got
 
   key="$(_cc_frozen_key_of "$title")"
   if [ -z "$key" ] || ! _cc_is_safe_token "$key"; then
@@ -421,10 +433,38 @@ _cc_frozen_row() {
     return 0
   fi
 
-  # RE-CLAIM. A state file is inert until a live @window_id on THIS server claims
-  # it; this is the only place that claim is ever re-established after a restart.
-  $TMUX_CMD set-option -w -t "$wid" @cc-frozen "$key" 2>/dev/null
-  _cc_frozen_repoint "$state" "$(_cc_server_pid)" "$wid"
+  # RE-CLAIM, AT THE LEVEL THE ENTRY IS WRITTEN IN. A state file is inert until a
+  # live id on THIS server carries its key, and this is the only place that claim
+  # is ever re-established after a restart — so it has to be re-established where
+  # the rest of the feature looks for it:
+  #
+  #   unit=pane    (everything since the atom became the pane) the claim is a
+  #                PANE option on the pane the tombstone came back in. Claiming
+  #                the window instead left the pane option absent until the next
+  #                freeze or thaw happened to touch it, so between a reboot and
+  #                that next act the pane's own claim did not exist.
+  #   unit=window  (a97bff0 and earlier, still on disk, still thawable) the claim
+  #                is a WINDOW option, which is what cc_thaw's legacy path reads
+  #                (_cc_legacy_key_of_window) before it rebuilds the window.
+  #
+  # The unit is read off the FILE (cc_store_unit), never inferred from the shape
+  # of the live layout: only the file knows which of the two things it describes.
+  unit="$(cc_store_unit "$state")"
+  if [ "$unit" = "pane" ]; then
+    scope="pane $pane_id"
+    $TMUX_CMD set-option -p -t "$pane_id" @cc-frozen "$key" 2>/dev/null
+    got="$($TMUX_CMD show-option -pqv -t "$pane_id" @cc-frozen 2>/dev/null)"
+    # A pane entry's pane id is re-pointed too: the %N it recorded died with the
+    # old server, and the entry now describes THIS pane.
+    _cc_frozen_repoint "$state" "$(_cc_server_pid)" "$wid" "$pane_id"
+  else
+    scope="window $wid"
+    $TMUX_CMD set-option -w -t "$wid" @cc-frozen "$key" 2>/dev/null
+    got="$($TMUX_CMD show-option -wqv -t "$wid" @cc-frozen 2>/dev/null)"
+    # A legacy entry describes a WINDOW; it has no pane id to re-point, and its
+    # file is left in exactly the shape cc_thaw's legacy path expects.
+    _cc_frozen_repoint "$state" "$(_cc_server_pid)" "$wid"
+  fi
   # The identity carrier is protected again: the restored pane's own prompt must
   # not be able to overwrite the title that holds the key.
   $TMUX_CMD set-option -p -t "$pane_id" allow-rename off 2>/dev/null
@@ -440,8 +480,23 @@ _cc_frozen_row() {
     [ "${CC_NO_NUDGE:-0}" != "1" ] && $TMUX_CMD send-keys -t "$pane_id" "" Enter 2>/dev/null
   fi
 
+  # The claim, READ BACK. `set-option -p` on a tmux with no pane-scoped user
+  # options fails into 2>/dev/null, and a re-claim that never happened would
+  # otherwise be reported as one. Nothing is undone when it did not take
+  # (D1/D2) — the tombstone title still carries the key, cc_thaw still finds it
+  # by title, the entry is still listed and thawable, the pane is left as the
+  # shell it already is. The boot says so out loud instead of certifying itself
+  # green, and the key still counts as SEEN (it is not a stale intent: its
+  # tombstone came back), so it is reported once, here, and not a second time by
+  # the stale-intent pass below.
+  if [ "$got" != "$key" ]; then
+    _cc_frozen_warn=$((_cc_frozen_warn + 1))
+    _cc_log "FROZEN-CLAIM-FAILED $target -> $pane_id key=$key unit=$unit: set-option on $scope did not take (read back '${got:-}') — nothing undone, entry still thawable by its ❄ title"
+    return 0
+  fi
+
   _cc_frozen_claimed=$((_cc_frozen_claimed + 1))
-  _cc_log "FROZEN-CLAIMED $target -> $pane_id key=$key window=$wid (state re-pointed at this server)"
+  _cc_log "FROZEN-CLAIMED $target -> $pane_id key=$key unit=$unit claim=$scope window=$wid (state re-pointed at this server)"
   return 0
 }
 
@@ -727,18 +782,21 @@ else
 fi
 
 # ── Frozen intents this snapshot did not carry (§4.5, the third shape) ───────
-# A window frozen AFTER the last save comes back AWAKE: the snapshot has no
+# A pane frozen AFTER the last save comes back AWAKE: the snapshot has no
 # tombstone row for it, its sessions resume exactly as they would have without
-# this feature, and the store is left holding an entry for a window that is now
+# this feature, and the store is left holding an entry for a pane that is now
 # running. The action is: nothing. Not a refreeze, not a discard, not a thaw —
 # the cost is one freeze that a reboot undid, a resource regression the user
 # re-does with one keystroke, and the entry stays listed and thawable.
 #
 # It is named here because otherwise it is the one shape whose cost is silent.
-# Detection is deliberately narrow: reported only when NO live window claims the
-# key AND a live window matches its recorded (session, window name) and is itself
-# awake. An entry whose window simply did not come back is NOT reported — that is
-# an ordinary frozen window waiting in the popup.
+# Detection is deliberately narrow: reported only when NOTHING LIVE CARRIES THE
+# KEY and a live window matches its recorded (session, window name). "Nothing
+# carries the key" is asked at the entry's OWN level — a pane entry's claim is a
+# pane option, so asking only the window option would report every restored pane
+# entry as an undone freeze. The key is compared, not merely "is anything
+# claimed": a window holding one frozen pane and one that came back awake owes
+# the user a warning about the second.
 _cc_ns="$(_cc_ns_dir_if_exists)"
 if [ -n "$_cc_ns" ]; then
   _cc_live_windows=""
@@ -752,12 +810,24 @@ if [ -n "$_cc_ns" ]; then
       -F '#{window_id}	#{session_name}	#{window_name}' 2>/dev/null)"
     _cc_es="$(_cc_unb64 "$(cc_store_scalar "$_cc_sf" session)")"
     _cc_en="$(_cc_unb64 "$(cc_store_scalar "$_cc_sf" window_name)")"
+    _cc_eu="$(cc_store_unit "$_cc_sf")"
     while IFS=$'\t' read -r _cc_wid _cc_ws _cc_wn; do
       [ -n "$_cc_wid" ] || continue
       [ "$_cc_ws" = "$_cc_es" ] && [ "$_cc_wn" = "$_cc_en" ] || continue
-      # A window that carries ANY claim is not an undone freeze.
-      [ -n "$($TMUX_CMD show-option -wqv -t "$_cc_wid" @cc-frozen 2>/dev/null)" ] && continue
-      _cc_log "FROZEN-STALE-INTENT key=$_cc_k: ${_cc_es}:${_cc_en} came back awake — the freeze did not survive the restart, entry left in the store"
+      if [ "$_cc_eu" = "pane" ]; then
+        # Every pane's claim in that window, wrapped in | for a substring test.
+        # An UNEXPANDED `#{@cc-frozen}` (a tmux too old for pane-scoped user
+        # options) is the format string, never a claim, and cannot match a key.
+        _cc_pcl="|$($TMUX_CMD list-panes -t "$_cc_wid" -F '#{@cc-frozen}' 2>/dev/null | tr '\n' '|')"
+        case "$_cc_pcl" in *"|${_cc_k}|"*) continue ;; esac
+      else
+        # Legacy entries keep the original, broader test — a window carrying ANY
+        # window-level claim is not reported. Only one window option can exist
+        # per window, so narrowing it to this key could only ever add a warning
+        # about an entry a second legacy entry is already sitting on.
+        [ -n "$($TMUX_CMD show-option -wqv -t "$_cc_wid" @cc-frozen 2>/dev/null)" ] && continue
+      fi
+      _cc_log "FROZEN-STALE-INTENT key=$_cc_k unit=$_cc_eu: ${_cc_es}:${_cc_en} came back awake — the freeze did not survive the restart, entry left in the store"
       _cc_frozen_warn=$((_cc_frozen_warn + 1))
       break
     done <<EOF
@@ -782,7 +852,7 @@ case "$_cc_frozen_entries"  in ''|*[!0-9]*) _cc_frozen_entries=0 ;; esac
 case "$_cc_frozen_sessions" in ''|*[!0-9]*) _cc_frozen_sessions=0 ;; esac
 _cc_frozen_clause=""
 [ "$_cc_frozen_entries" -gt 0 ] && \
-  _cc_frozen_clause=", $_cc_frozen_entries frozen window(s) held in the store ($_cc_frozen_sessions session(s), $_cc_frozen_claimed re-claimed this boot)"
+  _cc_frozen_clause=", $_cc_frozen_entries frozen entry(ies) held in the store ($_cc_frozen_sessions session(s), $_cc_frozen_claimed re-claimed this boot)"
 
 # ── Boot verdict ─────────────────────────────────────────────────────────────
 # Self-certify the restore so a real reboot reports pass/fail instead of leaving
@@ -825,7 +895,7 @@ if [ "$_cc_written" -ge "$_cc_resumable" ] && [ "$_cc_skipped_present" -eq 0 ] &
     # the user must be told about, and clearing the banner here would be the
     # feature quietly certifying its own regression.
     $TMUX_CMD set-option -g @claude-continuity-boot-warning \
-      "⚠ claude-continuity: $_cc_frozen_warn frozen window(s) not re-claimed — see $LOG_FILE" 2>/dev/null
+      "⚠ claude-continuity: $_cc_frozen_warn frozen entry(ies) not re-claimed — see $LOG_FILE" 2>/dev/null
   else
     $TMUX_CMD set-option -gu @claude-continuity-boot-warning 2>/dev/null
   fi
@@ -855,4 +925,4 @@ if [ -n "$_cc_ns" ] && type cc_ledger_seed >/dev/null 2>&1; then
   cc_ledger_seed
 fi
 
-_cc_log "post_restore DONE: wrote $_cc_written pending resume file(s), $_cc_proc_written extra process(es), re-claimed $_cc_frozen_claimed frozen window(s)"
+_cc_log "post_restore DONE: wrote $_cc_written pending resume file(s), $_cc_proc_written extra process(es), re-claimed $_cc_frozen_claimed frozen entry(ies)"

@@ -443,11 +443,25 @@ cc_proc_pane_root_cmd() {
 
 # Sum of RSS (bytes) over a pid list. Over-counts shared pages — every consumer
 # renders it with a leading "~" (P6).
+#
+# ONE `ps -axo pid=,rss=` and an awk join, NOT `ps -o rss= -p <list>`, and the
+# reason is measured rather than stylistic: on this machine (2312 processes),
+#
+#     ps -o rss= -p <one pid>          20 ms
+#     ps -o rss= -p <two pids>      7 000 – 12 000 ms      ← pathological
+#     ps -axo pid=,rss= (everything)  ~375 ms
+#
+# — reproducible, and true even for `-p "$$,$$"`. The old form ran once per
+# freeze and was, on its own, the single largest cost in the whole operation:
+# it made a one-pane freeze take ~6.4 s of which ~5 s was this call. Selecting
+# every process and filtering in awk is both faster and immune to the quirk.
 cc_proc_rss_sum() {
-  local p list="" total=0
-  for p in $1; do list="${list:+$list,}$p"; done
-  [ -n "$list" ] || { printf '0'; return 0; }
-  total="$(ps -o rss= -p "$list" 2>/dev/null | awk '{ s += $1 } END { printf "%d", s * 1024 }')"
+  local total=0
+  [ -n "${1:-}" ] || { printf '0'; return 0; }
+  total="$(ps -axo pid=,rss= 2>/dev/null | awk -v want="$1" '
+    BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) if (w[i] != "") sel[w[i]] = 1 }
+    ($1 in sel) { s += $2 }
+    END { printf "%d", s * 1024 }')"
   case "${total:-}" in ''|*[!0-9]*) total=0 ;; esac
   printf '%s' "$total"
 }
@@ -516,6 +530,19 @@ _cc_alive_of() {
   done
 }
 
+# Remove the exempt pids from a pid list. One pid per line in, one per line out.
+# Used for the WAIT set only — never for the kill set (D3).
+_cc_without() {
+  local keep="$1" exempt=" $2 " p out=""
+  for p in $keep; do
+    [ -n "$p" ] || continue
+    case "$exempt" in *" $p "*) continue ;; esac
+    out="${out}${p}
+"
+  done
+  printf '%s' "$out"
+}
+
 # Poll every 200 ms, one pid per line — never `kill -0 "$joined_string"`, the
 # false-pass that made P3's first probe "verify" a freeze that killed nothing.
 _cc_wait_gone() {
@@ -530,9 +557,27 @@ _cc_wait_gone() {
   [ -z "$(_cc_alive_of "$pids")" ]
 }
 
+# Args: <capture file> [<pids exempt from the WAIT set>]
+#
+# The exempt list is the D3 fix, and the distinction is exact:
+#
+#   * the KILL set is unchanged — every pid in the capture is still signalled by
+#     K1/K2/K3 exactly as before, exempt or not;
+#   * the WAIT set drops them, because an INTERACTIVE SHELL IGNORES SIGTERM BY
+#     DESIGN. The pane's own shell can therefore never leave K1's or K2's poll
+#     early, so both loops burn their full timeout (measured: ~8.5 s of dead
+#     wait per freeze) before K3's SIGKILL — which used to be the only thing
+#     that ended it.
+#
+# The caller passes the pane's root pid because the pane is respawned in place
+# immediately afterwards, and `respawn-pane -k` is what reclaims that shell.
+# The caller is still required to prove the exempt pids are gone AFTER the
+# respawn (cc_freeze.sh does, and reports PARTIAL if any survives), so nothing
+# leaves the accounting — only the waiting.
 cc_proc_kill() {
-  local cap="$1" all claude survivors p
+  local cap="$1" exempt="${2:-}" all wait_set claude survivors p
   all="$(awk -F'\t' '{ print $3 }' "$cap" 2>/dev/null)"
+  if [ -n "$exempt" ]; then wait_set="$(_cc_without "$all" "$exempt")"; else wait_set="$all"; fi
   if [ "${CC_NO_KILL:-0}" = "1" ]; then
     _cc_log "KILL-SKIPPED CC_NO_KILL=1 pids=$(printf '%s' "$all" | tr '\n' ',')"
     return 0
@@ -548,30 +593,32 @@ cc_proc_kill() {
                 [ -n "$_p" ] && awk -F'\t' -v p="$_p" '$3 == p { print $2 "\t" $3; exit }' "$cap"
               done | sort -n | awk -F'\t' '{ print $2 }')"
   for p in $claude; do kill -TERM "$p" 2>/dev/null; done
-  _cc_wait_gone "$all" 5
+  _cc_wait_gone "$wait_set" 5
 
-  # K2 — TERM the survivors, DEEPEST first.
-  survivors="$(_cc_alive_of "$all")"
+  # K2 — TERM the survivors, DEEPEST first. The exempt pids are still signalled
+  # (the kill set is the whole capture); they are simply not waited for.
+  survivors="$(_cc_alive_of "$wait_set")"
   if [ -n "$survivors" ]; then
     for p in $(awk -F'\t' '{ print $2 "\t" $3 }' "$cap" 2>/dev/null | sort -rn | awk -F'\t' '{ print $2 }'); do
       kill -0 "$p" 2>/dev/null && kill -TERM "$p" 2>/dev/null
     done
-    _cc_wait_gone "$all" 2
+    _cc_wait_gone "$wait_set" 2
   fi
 
   # K3 — KILL the survivors, DEEPEST first.
-  survivors="$(_cc_alive_of "$all")"
+  survivors="$(_cc_alive_of "$wait_set")"
   if [ -n "$survivors" ]; then
     for p in $(awk -F'\t' '{ print $2 "\t" $3 }' "$cap" 2>/dev/null | sort -rn | awk -F'\t' '{ print $2 }'); do
       kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null
     done
-    _cc_wait_gone "$all" 1
+    _cc_wait_gone "$wait_set" 1
   fi
 
   # K5 — whatever is left is named, not swallowed. A double-forked daemon is
   # invisible to a descendant walk by construction (§9.9); PARTIAL exists
-  # because reclamation is best-effort and says so.
-  survivors="$(_cc_alive_of "$all")"
+  # because reclamation is best-effort and says so. Exempt pids are excluded
+  # here and re-checked by the caller after the respawn that reclaims them.
+  survivors="$(_cc_alive_of "$wait_set")"
   [ -n "$survivors" ] && { printf '%s\n' "$survivors"; return 1; }
   return 0
 }

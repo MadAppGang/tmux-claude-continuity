@@ -130,8 +130,15 @@ _cc_tag_b64() {
 # cc_thaw.sh compares its own reconstruction against #{pane_start_command}, so
 # any drift between two copies would make every tombstone look "busy" to its
 # own thaw.
+# The replacement is FOUR characters — quote, backslash, quote, quote — and in a
+# double-quoted sed script that needs `\\\\`: the shell eats one layer and sed
+# eats another. Written with one fewer backslash it emits `'''`, which does not
+# round-trip through a shell at all ("unexpected EOF while looking for matching
+# `''"), and cc_thaw.sh's byte-comparison against #{pane_start_command} would
+# then read every tombstone as "the user is running something here". Verified by
+# eval, both forms, before choosing this one.
 _cc_shquote() {
-  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
 # ── Durable write (§2.4 / D3) ────────────────────────────────────────────────

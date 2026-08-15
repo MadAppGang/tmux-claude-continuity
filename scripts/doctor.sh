@@ -440,9 +440,9 @@ if [ "$TMUX_RUNNING" = true ]; then
   fi
 fi
 
-# ── Check 10: Frozen windows ─────────────────────────────────────────────────
+# ── Check 10: Frozen panes ───────────────────────────────────────────────────
 
-section "10. Frozen windows"
+section "10. Frozen panes"
 
 store_sh="$CURRENT_DIR/lib/cc_store.sh"
 popup_sh="$CURRENT_DIR/cc_popup.sh"
@@ -455,7 +455,23 @@ elif [ ! -f "$popup_sh" ] || [ ! -f "$store_sh" ]; then
 else
   store_dir="$(bash "$store_sh" dir 2>/dev/null)"
   inv="$(mktemp)"
-  bash "$popup_sh" --list 2>/dev/null > "$inv"
+  # ONE LEVEL, AND IT IS THE PANE — every count and every sum below reads this
+  # file, so the projection is chosen once, here.
+  #
+  # `--list` is now a session → window → pane TREE: the same frozen pane produces
+  # a pane row, its window's row and its session's row, and a bare row count
+  # would report it three times (the popup's own contract note says as much).
+  #
+  # The pane level, not `--level window`, because the pane is the atom AND
+  # because it is the only level where three of the four states below EXIST:
+  # a container row aggregates to AWAKE / FROZEN / PARTIAL only, so ORPHAN,
+  # DETACHED and FOREIGN are pane-row states — projecting to windows would
+  # silently report zero orphan tombstones, zero unclaimed entries and zero
+  # foreign-held entries forever. It is also the only level that counts a
+  # PARTIALLY frozen window's frozen pane at all (its window row reads PARTIAL,
+  # which is neither FROZEN nor an error), and the only one whose rss column can
+  # be summed without counting a pane's memory once per ancestor.
+  bash "$popup_sh" --list --level pane 2>/dev/null > "$inv"
 
   count_of() { awk -F'\t' -v s="$1" '$1 == s' "$inv" | wc -l | tr -d ' '; }
   n_frozen="$(count_of FROZEN)"
@@ -469,17 +485,24 @@ else
 
   info "store: $store_dir"
   if [ "$n_frozen" -eq 0 ]; then
-    ok "no frozen windows"
+    ok "no frozen panes"
   else
-    ok "$n_frozen frozen window(s), $freed held (approximate — shared pages are counted once per process)"
-    awk -F'\t' '$1 == "FROZEN" { printf "    %s:%s  %s  (%s panes, %s session ids, key %s)\n", $2, $3, $4, $7, $8, $9 }' "$inv"
+    ok "$n_frozen frozen pane(s), $freed held (approximate — shared pages are counted once per process)"
+    # $7 (pane_count) is 1 on every pane row, so the node id goes there instead:
+    # it is what identifies the pane, and what cc_freeze/cc_thaw take as a target.
+    # A legacy window entry is labelled as such in column 15 (`legacy-window`).
+    awk -F'\t' '$1 == "FROZEN" {
+      printf "    %s:%s  %s  %s  (%s session ids, key %s%s)\n",
+             $2, $3, $4, $13, $8, $9, ($15 == "legacy-window" ? ", legacy window entry" : "") }' "$inv"
   fi
 
-  # Unclaimed: a stored entry no live window carries. Inert by design — it can
-  # never resolve onto a neighbouring window — but it is still holding session
-  # ids, so it is either woken into a named window or discarded.
+  # Unclaimed: a stored entry no live pane carries. Inert by design — it can
+  # never resolve onto a neighbouring pane — but it is still holding session
+  # ids, so it is either woken into a window you name, or discarded. These are
+  # listed by the tree as pane rows under its `$stored` bucket, which is the
+  # second reason this section reads the pane level.
   if [ "$n_detached" -gt 0 ]; then
-    warn "$n_detached unclaimed entry(ies) — no live window claims them"
+    warn "$n_detached unclaimed entry(ies) — no live pane claims them"
     awk -F'\t' '$1 == "DETACHED" { printf "    %s  was %s:%s \"%s\"\n", $9, $2, $3, $4 }' "$inv"
     info "Wake one into a window you name:  $thaw_sh thaw --into <session:index> <key>"
     if ask_yn "Discard the $n_detached unclaimed entry(ies)? (nothing is killed; the session ids stay in the freeze log)"; then
@@ -490,12 +513,12 @@ else
     fi
   fi
 
-  # A tombstone whose state file is gone: the window is a shell wearing a frozen
+  # A tombstone whose state file is gone: the pane is a shell wearing a frozen
   # title. Nothing is deleted and nothing is respawned — this is reported, not
   # repaired, because the repair would have to guess.
   if [ "$n_orphan" -gt 0 ]; then
-    fail "$n_orphan orphan tombstone(s) — a ❄ window whose state file is missing or unreadable"
-    awk -F'\t' '$1 == "ORPHAN" { printf "    %s:%s \"%s\"  key %s\n", $2, $3, $4, $9 }' "$inv"
+    fail "$n_orphan orphan tombstone(s) — a ❄ pane whose state file is missing or unreadable"
+    awk -F'\t' '$1 == "ORPHAN" { printf "    %s:%s \"%s\"  %s  key %s\n", $2, $3, $4, $13, $9 }' "$inv"
     log_file="$(tmux show-option -gqv @claude-continuity-log-file 2>/dev/null)"
     log_file="${log_file:-$HOME/.tmux/scripts/claude-continuity-restore.log}"
     info "Session ids for these keys are recoverable from ${log_file%.log}-freeze.log:"

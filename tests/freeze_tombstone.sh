@@ -1,22 +1,40 @@
 #!/usr/bin/env bash
 # freeze_tombstone.sh — AC1, AC2, AC10 for `cc_freeze.sh freeze`.
 #
-#   AC1  3-pane window, 2 running Claude  -> freeze -> 1 pane remains; a state
-#        file lists 3 panes + 2 session ids; the 3 original pane PIDs are gone.
-#   AC2  frozen window at index 2 of 4    -> the other 3 indices are unchanged.
-#   AC10 freeze twice                     -> the second call succeeds (ALREADY,
-#        exit 0) and changes nothing.
+# THE ATOM IS A PANE (design-delta-tree). A window freeze is a LOOP over that
+# window's panes; nothing is collapsed and nothing is restructured. So:
 #
-# Asserted against the API contract in architecture §3.1 and the on-disk state
-# file format in §2.3 — never against any implementation detail.
+#   AC1  3-pane window, 2 running Claude -> freeze -> EVERY pane is a tombstone,
+#        the pane COUNT is unchanged, `window_layout` is unchanged, one state
+#        file per pane records that pane (3 files, 2 session ids between them),
+#        and the 3 original pane process trees are gone.
+#   AC2  frozen window at index 2 of 4   -> the other 3 window indices are
+#        unchanged, and so are this window's pane count and layout.
+#   AC10 freeze twice                    -> the second call succeeds (ALREADY per
+#        pane, exit 0) and changes nothing.
+#
+# WHY THE OLD ASSERTIONS WENT. This file used to assert "the window collapsed to
+# exactly 1 pane" and "the window carries @cc-frozen". Both encoded the WINDOW
+# model: a freeze collapsed N panes into one tombstone and replayed a recorded
+# layout on thaw. Under the pane model the window is never restructured, so
+# "1 pane" is now the assertion of a BUG (it would mean the freeze destroyed
+# panes), and the claim rides on the PANE option, not the window option. The
+# replacements are strictly stronger: pane count AND `window_layout` AND every
+# `pane_id` must be byte-identical across the freeze, which is exactly what
+# "respawn in place" means and is the property that makes layout replay
+# unnecessary (delta: "respawning every pane leaves window_layout BYTE-IDENTICAL").
+#
+# Asserted against the API contract in architecture §3.1 + design-delta-tree and
+# the on-disk state file format in §2.3 — never against any implementation detail.
 #
 # Two design rules this file obeys, both learned from false passes in this repo:
 #   * "the processes are gone" is only meaningful after asserting they were
 #     ALIVE. Every pid is iterated ONE PER LINE (`kill -0 "1 2 3"` always fails,
 #     which reports every process dead and passes forever).
-#   * the MECHANISM is asserted, not just the end state: the tombstone title,
-#     the recorded ;PID= tags, the state file's own counters and the stdout TSV
-#     must all agree with each other and with the live server.
+#   * the MECHANISM is asserted, not just the end state: the pane id survives
+#     while the pane PID changes (that IS "respawned in place"), the tombstone
+#     title, the recorded ;PID= tags, each state file's own counters and the
+#     stdout TSV must all agree with each other and with the live server.
 #
 # Fixtures are fake: symlinks to /bin/sh carrying the argv[0] the classifier
 # keys on, arranged as pane -> shell -> op(wrapper) -> claude, so `claude` is a
@@ -28,13 +46,14 @@
 #   `sh -c '<work>'`, because §H4 classifies a shell carrying an operand as
 #   SHELL-WITH-WORK => UNSAFE. That rail is deliberate and correct: Claude Code's
 #   Bash tool runs commands through a shell with `-c`, so an in-flight tool call
-#   is caught by its own parent and the window refuses to freeze. Parking a
+#   is caught by its own parent and the pane refuses to freeze. Parking a
 #   fixture on `sh -c` therefore makes EVERY freeze return
 #   `REFUSED … unsafe-process:sh` and proves nothing about the tombstone.
 #   It matches production, too: every real pane process on this machine is a
 #   bare `/bin/zsh` or `-zsh`, for Claude panes and idle panes alike.
 #   The unsafe path is exercised deliberately, where it is the point, in
-#   tests/freeze_gates.sh — not smuggled in through the scaffolding here.
+#   tests/freeze_gates.sh and tests/freeze_pane_atom.sh — not smuggled in
+#   through the scaffolding here.
 #
 # Isolation: own tmux socket, `-f /dev/null` on EVERY tmux invocation, every
 # directory under /tmp, CC_TEST=1 so the implementation re-checks the contract.
@@ -42,6 +61,15 @@
 # Usage: bash tests/freeze_tombstone.sh   (exit 0 = pass)
 
 set -uo pipefail
+
+# ── RESURRECT SAVE-SIDE ISOLATION ────────────────────────────────────────────
+# RESURRECT_FILE redirects resurrect READS. Only @resurrect-dir redirects its
+# WRITES. A test that triggers a save without setting it deposits fixture
+# snapshots in the user's live resurrect directory and can leave `last`
+# pointing at one. See tests/lib/resurrect_guard.sh for the measured damage.
+. "$(cd "$(dirname "$0")" && pwd)/lib/resurrect_guard.sh" || {
+  echo "ABORT: tests/lib/resurrect_guard.sh is missing"; exit 1; }
+cc_register_test_session _seed work legacy alpha beta lvl cA cB cC cD cE
 
 SOCKET="ccft$$"
 TD="/tmp/ccft-$$"
@@ -60,6 +88,7 @@ FREEZE="$SCRIPT_DIR/cc_freeze.sh"
 TMUX_CMD_STR="tmux -L $SOCKET -f /dev/null"
 NOW="$(date +%s)"
 DAY="$(date -r "$NOW" +%Y-%m-%d)"
+SNOW="$(printf '\xe2\x9d\x84')"   # the tombstone sigil, out of the source line
 
 pass=0
 fail=0
@@ -98,7 +127,10 @@ _kill_fixtures() {
   done < "$TD/ps.exit"
 }
 _teardown() { _t kill-server 2>/dev/null; _kill_fixtures; rm -rf "$TD"; }
-trap _teardown EXIT INT TERM
+# Re-wrap the teardown so a leak into the real resurrect dir fails the run
+# even on the early-abort paths that never reach the final assertions.
+_cc_teardown_guarded() { _teardown; cc_warn_on_resurrect_leak || exit 1; }
+trap _cc_teardown_guarded EXIT INT TERM
 
 mkdir -p "$FD" "$PD/by-pid" "$LD" "$QD" "$RD" "$BIN" "$FIX"
 
@@ -147,6 +179,10 @@ _t set-option -g @claude-continuity-claude-cmd   "echo" >/dev/null
 _t set-option -g @claude-continuity-claudish-cmd "claudish" >/dev/null
 _t set-option -g @claude-continuity-freeze-dir   "$FD" >/dev/null
 _t set-option -g @resurrect-dir                  "$RD" >/dev/null
+# Pre-flight: ask the SERVER what it will actually use and refuse to run if
+# the answer is the user's real directory. A set-option that ran too early or
+# at the wrong scope leaves the default in place, and only asking catches it.
+cc_guard_resurrect_dir "$RD" tmux -L "$SOCKET" -f /dev/null
 
 # work:1..4 — window 2 is the target, 1/3/4 are the neighbours AC2 protects.
 # No pane is given a command: each is the bare interactive shell the freeze
@@ -181,8 +217,6 @@ _count_alive() { # <file of pids, ONE PER LINE>
   done < "$1"
   printf '%s' "$n"
 }
-_list_alive_ids() { local p; while IFS= read -r p; do [ -z "$p" ] && continue
-    kill -0 "$p" 2>/dev/null && printf '%s ' "$p"; done < "$1"; }
 _list_alive() { local p; while IFS= read -r p; do [ -z "$p" ] && continue
     kill -0 "$p" 2>/dev/null && printf '%s(%s) ' "$p" "$(_pid_cmd "$p" | cut -c1-40)"; done < "$1"; }
 
@@ -266,10 +300,15 @@ while IFS= read -r p; do
 done < "$CLAUDE_PIDS"
 
 WINDOWS_BEFORE="$(_t list-windows -t work -F '#{window_index}:#{window_name}' | tr '\n' ' ')"
+LAYOUT_BEFORE="$(_t display-message -p -t work:2 '#{window_layout}')"
+PANE_IDS_BEFORE="$(_t list-panes -t work:2 -F '#{pane_index}=#{pane_id}' | tr '\n' ' ')"
+PANE_PIDS_BEFORE="$(_t list-panes -t work:2 -F '#{pane_pid}' | tr '\n' ' ')"
 echo "    windows before: $WINDOWS_BEFORE"
+echo "    layout before:  $LAYOUT_BEFORE"
+echo "    panes before:   $PANE_IDS_BEFORE"
 
-# Pending/launch files that must be cleaned up for the destroyed panes (§3.1.12)
-# — plus one on an UNRELATED window that must survive untouched.
+# Pending/launch files that must not survive on a frozen pane (§3.1.12) — plus
+# one on an UNRELATED window that must survive untouched.
 _t list-panes -t work:2 -F '#{pane_id}' > "$TD/target_pane_ids"
 i=0
 while IFS= read -r pid; do
@@ -286,97 +325,139 @@ _freeze() {
   CC_TEST=1 TMUX_CMD="$TMUX_CMD_STR" CC_FREEZE_DIR="$FD" CC_LOG_FILE="$LOG" \
   CC_NOW="$NOW" CC_NO_SAVE=1 bash "$FREEZE" "$@"
 }
-_field() { printf '%s\n' "$1" | awk -F'\t' -v n="$2" 'NF>=2 { print $n; exit }'; }
-_state_path() { ls "$FD"/*/"$1.state" 2>/dev/null | head -1; }
-_state_count() { ls "$FD"/*/*.state 2>/dev/null | wc -l | tr -d ' '; }
-_scalar() { awk -F'\t' -v k="$2" '$1==k { print $2; exit }' "$1"; }
+# stdout is one row per PANE, plus container summary rows whose first field is
+# the container level (WINDOW / SESSION). A consumer that counts pane outcomes
+# must exclude the summaries — that is the whole reason they are distinguishable.
+_pane_rows()    { printf '%s\n' "$1" | awk -F'\t' 'NF>=2 && $1!="WINDOW" && $1!="SESSION"'; }
+_summary_rows() { printf '%s\n' "$1" | awk -F'\t' 'NF>=2 && ($1=="WINDOW" || $1=="SESSION")'; }
+_row_for()      { printf '%s\n' "$1" | awk -F'\t' -v t="$2" 'NF>=2 && $2==t { print; exit }'; }
+_col()          { printf '%s\n' "$1" | awk -F'\t' -v n="$2" 'NF>=2 { print $n; exit }'; }
+_nrows()        { printf '%s\n' "$1" | grep -c . | tr -d ' '; }
+_state_path()   { ls "$FD"/*/"$1.state" 2>/dev/null | head -1; }
+_state_count()  { ls "$FD"/*/*.state 2>/dev/null | wc -l | tr -d ' '; }
+_scalar()       { awk -F'\t' -v k="$2" '$1==k { print $2; exit }' "$1"; }
 _b64d() { printf '%s' "$1" | base64 -d 2>/dev/null || printf '%s' "$1" | base64 -D 2>/dev/null; }
 _tagged() { # <file> <line type> <tag> -> one value per matching line
   awk -F'\t' -v lt="$2" -v tag="$3" '$1==lt {
     for (i=1; i<=NF; i++) if (index($i, tag) == 1) print substr($i, length(tag)+1) }' "$1"
 }
+_pane_opt() { _t show-options -p -t "$1" -v @cc-frozen 2>/dev/null || true; }
+_title_of() { _t display-message -p -t "$1" '#{pane_title}' 2>/dev/null; }
 
-# ── 1. AC1 — freeze collapses to a tombstone and records everything ──────────
+# ── 1. AC1 — every pane becomes a tombstone, in place ────────────────────────
 echo ""
 echo "[1] AC1: freeze a 3-pane window with 2 Claude sessions"
 OUT="$(_freeze freeze --no-save work:2 2>"$TD/err1")"; RC=$?
 printf '    exit=%s stdout=[%s]\n' "$RC" "$OUT"
 [ -s "$TD/err1" ] && printf '    stderr: %s\n' "$(head -3 "$TD/err1")"
 
-assert_eq "exit code 0 on success"           "$RC" "0"
-assert_eq "exactly one TSV line for one target" "$(printf '%s\n' "$OUT" | grep -c .)" "1"
-VERB="$(_field "$OUT" 1)"
-assert_eq "stdout verb is FROZE"             "$VERB" "FROZE"
-assert_eq "stdout target is work:2"          "$(_field "$OUT" 2)" "work:2"
-assert_eq "stdout pane count is 3"           "$(_field "$OUT" 4)" "3"
-assert_eq "stdout sid count is 2"            "$(_field "$OUT" 5)" "2"
-KEY="$(_field "$OUT" 3)"
-assert_ne "stdout carries a key"             "$KEY" "-"
+PANE_ROWS="$(_pane_rows "$OUT")"
+SUMMARY="$(_summary_rows "$OUT")"
+assert_eq "exit code 0 when every pane freezes" "$RC" "0"
+assert_eq "one stdout row per PANE (the atom), not one per window" "$(_nrows "$PANE_ROWS")" "3"
+assert_eq "every pane row reports FROZE" \
+  "$(printf '%s\n' "$PANE_ROWS" | awk -F'\t' '$1!="FROZE"' | grep -c . | tr -d ' ')" "0"
+assert_eq "pane rows are targeted by session:index.pane" \
+  "$(printf '%s\n' "$PANE_ROWS" | awk -F'\t' '{print $2}' | sort | tr '\n' ' ')" \
+  "work:2.1 work:2.2 work:2.3 "
+assert_eq "every pane row carries the 6-column freeze contract" \
+  "$(printf '%s\n' "$PANE_ROWS" | awk -F'\t' 'NF!=6' | grep -c . | tr -d ' ')" "0"
+assert_eq "each pane row counts ITSELF: 1 pane" \
+  "$(printf '%s\n' "$PANE_ROWS" | awk -F'\t' '$4!=1' | grep -c . | tr -d ' ')" "0"
+assert_eq "the sids reported across the pane rows total 2" \
+  "$(printf '%s\n' "$PANE_ROWS" | awk -F'\t' '{s+=$5} END {print s+0}')" "2"
+# A container summary is a different row type so a counter cannot treble-count.
+assert_eq "exactly one container summary row for a window target" "$(_nrows "$SUMMARY")" "1"
+assert_eq "the summary is the WINDOW level" "$(_col "$SUMMARY" 1)" "WINDOW"
+assert_eq "the summary names the window, not a pane" "$(_col "$SUMMARY" 2)" "work:2"
+assert_eq "the summary's last column is the window's pane count" \
+  "$(printf '%s\n' "$SUMMARY" | awk -F'\t' '{print $NF; exit}')" "3"
 
-# --- the window itself
-assert_eq "window collapsed to exactly 1 pane" "$(_t list-panes -t work:2 | wc -l | tr -d ' ')" "1"
-TOMB_ID="$(_t list-panes -t work:2 -F '#{pane_id}' | head -1)"
-# NEVER pass an empty -t: tmux silently falls back to the CURRENT pane, which
-# turns "the tombstone looks right" into a comparison of one unrelated pane with
-# itself. A bogus id makes every read below fail loudly instead.
-if [ -z "$TOMB_ID" ]; then
-  no "the frozen window still has a pane to read" "work:2 lists no panes"
-  TOMB_ID="__nopane__"
-fi
-TOMB_TITLE="$(_t display-message -p -t "$TOMB_ID" '#{pane_title}' 2>/dev/null)"
-printf '    tombstone title: [%s]\n' "$TOMB_TITLE"
-assert_eq "tombstone title is the contract string" \
-  "$TOMB_TITLE" "$(printf '\xe2\x9d\x84 FROZEN %s 3p/2s %s' "$KEY" "$DAY")"
-assert_eq "allow-rename is off on the tombstone pane" \
-  "$(_t show-options -p -t "$TOMB_ID" -v allow-rename 2>/dev/null || true)" "off"
-assert_eq "the window carries the @cc-frozen claim" \
-  "$(_t show-options -w -t work:2 -v @cc-frozen 2>/dev/null)" "$KEY"
+KEY1="$(_col "$(_row_for "$OUT" work:2.1)" 3)"
+KEY2="$(_col "$(_row_for "$OUT" work:2.2)" 3)"
+KEY3="$(_col "$(_row_for "$OUT" work:2.3)" 3)"
+assert_eq "every pane got its own key" \
+  "$(printf '%s\n%s\n%s\n' "$KEY1" "$KEY2" "$KEY3" | sort -u | grep -c . | tr -d ' ')" "3"
+for k in "$KEY1" "$KEY2" "$KEY3"; do assert_ne "a pane row carries a key" "$k" "-"; done
+
+# --- the window is NOT restructured (the whole point of the pane atom)
+assert_eq "the pane COUNT is unchanged" "$(_t list-panes -t work:2 | wc -l | tr -d ' ')" "3"
+assert_eq "window_layout is byte-identical across the freeze" \
+  "$(_t display-message -p -t work:2 '#{window_layout}')" "$LAYOUT_BEFORE"
+assert_eq "every pane kept its pane id (respawned IN PLACE, not recreated)" \
+  "$(_t list-panes -t work:2 -F '#{pane_index}=#{pane_id}' | tr '\n' ' ')" "$PANE_IDS_BEFORE"
+# ...and the mechanism: a respawn means the pane's own pid changed.
+assert_ne "the pane processes were respawned (pane_pid changed)" \
+  "$(_t list-panes -t work:2 -F '#{pane_pid}' | tr '\n' ' ')" "$PANE_PIDS_BEFORE"
 assert_eq "the window keeps its name" \
   "$(_t display-message -p -t work:2 '#{window_name}')" "target"
 
-# --- the state file (§2.3)
-SF="$(_state_path "$KEY")"
-if [ -n "$SF" ] && [ -s "$SF" ]; then ok "state file exists for the key ($SF)"
-else no "state file exists for the key" "no $FD/*/$KEY.state"; fi
-if [ -n "$SF" ] && [ -s "$SF" ]; then
-  echo "    --- state file ---"; sed 's/^/      /' "$SF"; echo "    ------------------"
-  assert_eq "line 1 is the version marker" "$(head -1 "$SF")" "$(printf 'v\t1')"
-  assert_eq "last line is the integrity terminator" "$(tail -1 "$SF")" "$(printf 'end\t1')"
-  assert_eq "pane_count is 3"    "$(_scalar "$SF" pane_count)" "3"
-  assert_eq "sid_count is 2"     "$(_scalar "$SF" sid_count)"  "2"
-  assert_eq "claude_procs is 2 (the gate's denominator)" "$(_scalar "$SF" claude_procs)" "2"
-  assert_eq "window_index is 2"  "$(_scalar "$SF" window_index)" "2"
-  assert_eq "3 pane lines"       "$(awk -F'\t' '$1=="pane"' "$SF" | wc -l | tr -d ' ')" "3"
-  assert_eq "2 sid lines"        "$(awk -F'\t' '$1=="sid"'  "$SF" | wc -l | tr -d ' ')" "2"
-  assert_eq "pane indices are 1 2 3" \
-    "$(awk -F'\t' '$1=="pane" {print $2}' "$SF" | sort -n | tr '\n' ' ')" "1 2 3 "
-  assert_eq "session name decodes to work" "$(_b64d "$(_scalar "$SF" session)")" "work"
-  assert_eq "window name decodes to target" "$(_b64d "$(_scalar "$SF" window_name)")" "target"
-  assert_ne "layout string recorded" "$(_scalar "$SF" layout)" ""
-  # one session per line, and both ids are the ones we planted
-  assert_eq "both session ids recorded, one per line" \
-    "$(_tagged "$SF" sid ';CLAUDE_SID=' | sort | tr '\n' ' ')" "$SID_A $SID_B "
-  # One session per line: a line count, a tag count and an occurrence count must
-  # all agree, or a two-Claude pane is unrepresentable and `grep -c` lies.
-  assert_eq "CLAUDE_SID occurrence count agrees with sid_count" \
-    "$(grep -o 'CLAUDE_SID=' "$SF" | wc -l | tr -d ' ')" "2"
-  assert_eq "every recorded sid is a 36-char uuid" \
-    "$(_tagged "$SF" sid ';CLAUDE_SID=' | grep -cv '^[0-9a-f-]\{36\}$' | tr -d ' ')" "0"
-  assert_eq "no ;DUP= marker ever reaches the state file" \
-    "$(grep -c 'DUP=' "$SF" | tr -d ' ')" "0"
-  assert_eq "both sids are ROLE=primary" \
-    "$(_tagged "$SF" sid ';ROLE=' | grep -c '^primary$' | tr -d ' ')" "2"
-  # every pane line carries a non-empty cwd that decodes to a real directory
-  BADCWD=0
-  while IFS= read -r c; do
-    [ -z "$c" ] && { BADCWD=$((BADCWD+1)); continue; }
-    [ -d "$(_b64d "$c")" ] || BADCWD=$((BADCWD+1))
-  done < <(_tagged "$SF" pane ';CWD=')
-  assert_eq "every pane records a decodable, existing cwd" "$BADCWD" "0"
-  # No empty TAB field anywhere in the file (FR6.2 applies to the store too).
-  assert_eq "no empty TAB-separated field in the state file" \
-    "$(grep -c "$(printf '\t\t')" "$SF" | tr -d ' ')" "0"
-fi
+# --- every pane is a tombstone, and its claim is a PANE option
+BADTITLE=0; BADCLAIM=0; BADRENAME=0
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  idx="${line%% *}"; pid="${line#* }"
+  case "$idx" in 1) k="$KEY1"; s=1 ;; 2) k="$KEY2"; s=1 ;; *) k="$KEY3"; s=0 ;; esac
+  want="$(printf '%s FROZEN %s 1p/%ss %s' "$SNOW" "$k" "$s" "$DAY")"
+  got="$(_title_of "$pid")"
+  [ "$got" = "$want" ] || { BADTITLE=$((BADTITLE+1)); echo "        pane $idx title: got [$got] want [$want]"; }
+  [ "$(_pane_opt "$pid")" = "$k" ] || { BADCLAIM=$((BADCLAIM+1))
+    echo "        pane $idx claim: got [$(_pane_opt "$pid")] want [$k]"; }
+  [ "$(_t show-options -p -t "$pid" -v allow-rename 2>/dev/null)" = "off" ] || BADRENAME=$((BADRENAME+1))
+done < <(_t list-panes -t work:2 -F '#{pane_index} #{pane_id}')
+assert_eq "every pane carries the contract tombstone title" "$BADTITLE" "0"
+assert_eq "every pane carries its own @cc-frozen claim (a PANE option)" "$BADCLAIM" "0"
+assert_eq "allow-rename is off on every tombstone pane" "$BADRENAME" "0"
+
+# --- the store: one entry per pane (§2.3 + delta "one state file per frozen pane")
+assert_eq "one state file per frozen pane" "$(_state_count)" "3"
+TOTAL_SIDS=0; TOTAL_PANELINES=0; BADUNIT=0; BADIDX=0; BADPANEID=0; BADGATE=0; BADTAB=0
+RECPIDS="$TD/recorded_pids"; : > "$RECPIDS"
+ALLSIDS="$TD/all_sids"; : > "$ALLSIDS"
+for k in "$KEY1" "$KEY2" "$KEY3"; do
+  SF="$(_state_path "$k")"
+  if [ -z "$SF" ] || [ ! -s "$SF" ]; then no "state file exists for key $k" "no $FD/*/$k.state"; continue; fi
+  ok "state file exists for key $k"
+  echo "    --- $k ---"; sed 's/^/      /' "$SF"
+  assert_eq "$k: line 1 is the version marker" "$(head -1 "$SF")" "$(printf 'v\t1')"
+  assert_eq "$k: an integrity terminator is present" \
+    "$(grep -c "$(printf 'end\t1')" "$SF" | tr -d ' ')" "1"
+  [ "$(_scalar "$SF" unit)" = "pane" ] || BADUNIT=$((BADUNIT+1))
+  [ "$(_scalar "$SF" window_index)" = "2" ] || BADIDX=$((BADIDX+1))
+  # the entry must name the LIVE pane it claims, and that pane must claim it back
+  spid="$(_scalar "$SF" pane_id)"
+  [ "$(_pane_opt "$spid")" = "$k" ] || { BADPANEID=$((BADPANEID+1))
+    echo "        $k: recorded pane_id [$spid] does not claim this key"; }
+  [ "$(_scalar "$SF" sid_count)" = "$(_scalar "$SF" claude_procs)" ] || BADGATE=$((BADGATE+1))
+  TOTAL_SIDS=$((TOTAL_SIDS + $(awk -F'\t' '$1=="sid"' "$SF" | wc -l | tr -d ' ')))
+  TOTAL_PANELINES=$((TOTAL_PANELINES + $(awk -F'\t' '$1=="pane"' "$SF" | wc -l | tr -d ' ')))
+  [ "$(grep -c "$(printf '\t\t')" "$SF" | tr -d ' ')" = "0" ] || BADTAB=$((BADTAB+1))
+  { _tagged "$SF" pane ';PID='; _tagged "$SF" sid ';PID='; } >> "$RECPIDS"
+  _tagged "$SF" sid ';CLAUDE_SID=' >> "$ALLSIDS"
+done
+echo "    ------------------"
+assert_eq "every entry declares unit=pane"                 "$BADUNIT" "0"
+assert_eq "every entry records window_index 2"             "$BADIDX" "0"
+assert_eq "every entry names the live pane that claims it" "$BADPANEID" "0"
+assert_eq "every entry's sid_count equals its claude_procs (the gate's own books)" "$BADGATE" "0"
+assert_eq "no empty TAB-separated field in any state file" "$BADTAB" "0"
+assert_eq "exactly one pane line per entry"                "$TOTAL_PANELINES" "3"
+assert_eq "2 sid lines across the three entries"           "$TOTAL_SIDS" "2"
+assert_eq "both session ids recorded, one per line" \
+  "$(sort "$ALLSIDS" | grep . | tr '\n' ' ')" "$SID_A $SID_B "
+assert_eq "every recorded sid is a 36-char uuid" \
+  "$(grep -cv '^[0-9a-f-]\{36\}$' "$ALLSIDS" | tr -d ' ')" "0"
+assert_eq "no ;DUP= marker ever reaches the store" \
+  "$(cat "$FD"/*/*.state 2>/dev/null | grep -c 'DUP=' | tr -d ' ')" "0"
+assert_eq "every recorded sid is ROLE=primary" \
+  "$(cat "$FD"/*/*.state 2>/dev/null | awk -F'\t' '$1=="sid"' | grep -vc ';ROLE=primary' | tr -d ' ')" "0"
+BADCWD=0
+while IFS= read -r c; do
+  [ -z "$c" ] && { BADCWD=$((BADCWD+1)); continue; }
+  [ -d "$(_b64d "$c")" ] || BADCWD=$((BADCWD+1))
+done < <(cat "$FD"/*/*.state 2>/dev/null | awk -F'\t' '$1=="pane" {
+    for (i=1;i<=NF;i++) if (index($i,";CWD=")==1) print substr($i,6) }')
+assert_eq "every pane entry records a decodable, existing cwd" "$BADCWD" "0"
 
 # --- the processes: ALIVE before (asserted above) -> dead now, one pid per line
 for _w in 1 2 3 4 5 6 7 8 9 10; do
@@ -389,55 +470,47 @@ if [ "$ALIVE_AFTER" = "0" ]; then
 else
   no "all $N_TREE captured pids are dead after the freeze" "still alive: $(_list_alive "$TREE")"
 fi
-if [ -n "$SF" ] && [ -s "$SF" ]; then
-  RECPIDS="$TD/recorded_pids"
-  { _tagged "$SF" pane ';PID='; _tagged "$SF" sid ';PID='; } | sort -u | grep . > "$RECPIDS"
-  NREC="$(_count_lines "$RECPIDS")"
-  if [ "${NREC:-0}" -ge 3 ]; then ok "state file records at least one pid per pane ($NREC)"
-  else no "state file records at least one pid per pane" "recorded $NREC pids"; fi
-  RALIVE="$(_count_alive "$RECPIDS")"
-  if [ "$RALIVE" = "0" ]; then ok "every ;PID= recorded in the state file is dead"
-  else no "every ;PID= recorded in the state file is dead" "still alive: $(_list_alive "$RECPIDS")"; fi
-  # and the recorded pids really were part of the pre-freeze tree
-  UNKNOWN=0
-  while IFS= read -r p; do grep -qx "$p" "$TREE" || UNKNOWN=$((UNKNOWN+1)); done < "$RECPIDS"
-  assert_eq "every recorded pid came from the pre-freeze tree" "$UNKNOWN" "0"
-fi
+sort -u "$RECPIDS" -o "$RECPIDS"
+NREC="$(_count_lines "$RECPIDS")"
+if [ "${NREC:-0}" -ge 3 ]; then ok "the store records at least one pid per pane ($NREC)"
+else no "the store records at least one pid per pane" "recorded $NREC pids"; fi
+RALIVE="$(_count_alive "$RECPIDS")"
+if [ "$RALIVE" = "0" ]; then ok "every ;PID= recorded in the store is dead"
+else no "every ;PID= recorded in the store is dead" "still alive: $(_list_alive "$RECPIDS")"; fi
+UNKNOWN=0
+while IFS= read -r p; do grep -qx "$p" "$TREE" || UNKNOWN=$((UNKNOWN+1)); done < "$RECPIDS"
+assert_eq "every recorded pid came from the pre-freeze tree" "$UNKNOWN" "0"
 
 # --- side effects
-BANNER="$(ls "$FD"/*/"$KEY.banner" 2>/dev/null | head -1)"
-if [ -n "$BANNER" ] && [ -s "$BANNER" ]; then ok "banner file written ($BANNER)"
-else no "banner file written" "no non-empty $FD/*/$KEY.banner"; fi
-if grep -q "$KEY" "$FLOG" 2>/dev/null; then ok "the freeze is recorded in the dedicated freeze log"
-else no "the freeze is recorded in the dedicated freeze log" "no mention of $KEY in $FLOG"; fi
-
-# The destroyed panes' pending + launch files must go, or the next nudge relaunches
-# Claude into a tombstone and the next save attributes a dead typed command to it.
-for v in TP2 TP3; do
-  eval "p=\${$v:-}"
-  [ -z "$p" ] && continue
-  if [ -e "$QD/${p#%}" ]; then no "pending file removed for destroyed pane $p" \
-      "still present: $(cat "$QD/${p#%}")"; else ok "pending file removed for destroyed pane $p"; fi
-  if [ -e "$LD/${p#%}" ]; then no "launch file removed for destroyed pane $p" \
-      "still present: $(cat "$LD/${p#%}")"; else ok "launch file removed for destroyed pane $p"; fi
+MISSBANNER=0; MISSLOG=0
+for k in "$KEY1" "$KEY2" "$KEY3"; do
+  b="$(ls "$FD"/*/"$k.banner" 2>/dev/null | head -1)"
+  [ -n "$b" ] && [ -s "$b" ] || MISSBANNER=$((MISSBANNER+1))
+  grep -q "$k" "$FLOG" 2>/dev/null || MISSLOG=$((MISSLOG+1))
 done
-# Pane 1 is respawned as the tombstone rather than destroyed; whatever is queued
-# for it, it must never be a Claude resume.
-STALE_RESUME=0
+assert_eq "a banner is written for every frozen pane"          "$MISSBANNER" "0"
+assert_eq "every freeze is recorded in the dedicated freeze log" "$MISSLOG" "0"
+
+# A frozen pane must not be left holding a queued Claude resume, or the next
+# nudge relaunches Claude into a tombstone and the next save attributes a dead
+# typed command to it.
+STALE_RESUME=0; STALE_LAUNCH=0
 while IFS= read -r p; do
   [ -z "$p" ] && continue
   case "$(cat "$QD/${p#%}" 2>/dev/null)" in *--resume*) STALE_RESUME=$((STALE_RESUME+1)) ;; esac
+  [ -e "$LD/${p#%}" ] && STALE_LAUNCH=$((STALE_LAUNCH+1))
 done < "$TD/target_pane_ids"
 assert_eq "no frozen pane is left with a queued Claude resume" "$STALE_RESUME" "0"
+assert_eq "no frozen pane is left with a stale launch record"  "$STALE_LAUNCH" "0"
 # and nothing outside the frozen window was touched
 assert_eq "an unrelated window's pending file survives" \
   "$(cat "$QD/${OTHER_PANE#%}" 2>/dev/null)" "echo --resume other-sid"
 assert_eq "an unrelated window's launch file survives" \
   "$(cat "$LD/${OTHER_PANE#%}" 2>/dev/null)" "c --worktree other"
 
-# ── 2. AC2 — no window is renumbered ─────────────────────────────────────────
+# ── 2. AC2 — no window is renumbered, no window is restructured ──────────────
 echo ""
-echo "[2] AC2: freezing must not renumber any window"
+echo "[2] AC2: freezing must not renumber any window, nor restructure one"
 WINDOWS_AFTER="$(_t list-windows -t work -F '#{window_index}:#{window_name}' | tr '\n' ' ')"
 printf '    windows after:  %s\n' "$WINDOWS_AFTER"
 assert_eq "window index:name list is byte-identical" "$WINDOWS_AFTER" "$WINDOWS_BEFORE"
@@ -445,42 +518,56 @@ assert_eq "the session still has 4 windows" \
   "$(_t list-windows -t work | wc -l | tr -d ' ')" "4"
 assert_eq "the neighbours still have one pane each" \
   "$(for w in 1 3 4; do _t list-panes -t "work:$w" | wc -l | tr -d ' '; done | tr '\n' ' ')" "1 1 1 "
+assert_eq "the frozen window's pane count is stable" \
+  "$(_t list-panes -t work:2 | wc -l | tr -d ' ')" "3"
+assert_eq "the frozen window's layout is stable" \
+  "$(_t display-message -p -t work:2 '#{window_layout}')" "$LAYOUT_BEFORE"
 
 # ── 3. AC10 — idempotency ────────────────────────────────────────────────────
 echo ""
 echo "[3] AC10: freezing an already-frozen window succeeds and changes nothing"
-if [ -z "$SF" ] || [ ! -s "$SF" ]; then
-  no "AC10 state-file invariance" "the first freeze produced no state file to compare"
-  SF="$TD/.nostate"; : > "$SF"
-fi
-SUM_BEFORE="$(cksum < "$SF" 2>/dev/null)"
-TOMB_PID_BEFORE="$(_t list-panes -t work:2 -F '#{pane_pid}' | head -1)"
-[ -n "$TOMB_PID_BEFORE" ] || TOMB_PID_BEFORE="__nopane__"
+SUMS_BEFORE="$(for k in "$KEY1" "$KEY2" "$KEY3"; do cksum < "$(_state_path "$k")" 2>/dev/null; done)"
+TOMB_PIDS_BEFORE="$(_t list-panes -t work:2 -F '#{pane_pid}' | tr '\n' ' ')"
+TITLES_BEFORE="$(_t list-panes -t work:2 -F '#{pane_title}' | tr '\n' '|')"
 STATES_BEFORE="$(_state_count)"
 
 OUT2="$(_freeze freeze --no-save work:2 2>"$TD/err2")"; RC2=$?
 printf '    exit=%s stdout=[%s]\n' "$RC2" "$OUT2"
-assert_eq "second freeze exits 0"        "$RC2" "0"
-assert_eq "second freeze reports ALREADY" "$(_field "$OUT2" 1)" "ALREADY"
-assert_eq "second freeze reports the same key" "$(_field "$OUT2" 3)" "$KEY"
-assert_eq "still exactly 1 pane"         "$(_t list-panes -t work:2 | wc -l | tr -d ' ')" "1"
-assert_eq "state file is byte-identical" "$(cksum < "$SF" 2>/dev/null)" "$SUM_BEFORE"
-assert_eq "no second state file was written" "$(_state_count)" "$STATES_BEFORE"
-TOMB_PID_AFTER="$(_t list-panes -t work:2 -F '#{pane_pid}' | head -1)"
-[ -n "$TOMB_PID_AFTER" ] || TOMB_PID_AFTER="__nopane__"
-assert_eq "the tombstone pane was not respawned" "$TOMB_PID_AFTER" "$TOMB_PID_BEFORE"
-assert_eq "tombstone title unchanged" \
-  "$(_t display-message -p -t "$TOMB_ID" '#{pane_title}' 2>/dev/null || true)" "$TOMB_TITLE"
+PANE_ROWS2="$(_pane_rows "$OUT2")"
+assert_eq "second freeze exits 0" "$RC2" "0"
+assert_eq "every pane reports ALREADY" \
+  "$(printf '%s\n' "$PANE_ROWS2" | awk -F'\t' '$1!="ALREADY"' | grep -c . | tr -d ' ')" "0"
+assert_eq "still one row per pane" "$(_nrows "$PANE_ROWS2")" "3"
+assert_eq "the keys are the same keys" \
+  "$(printf '%s\n' "$PANE_ROWS2" | awk -F'\t' '{print $3}' | sort | tr '\n' ' ')" \
+  "$(printf '%s\n%s\n%s\n' "$KEY1" "$KEY2" "$KEY3" | sort | tr '\n' ' ')"
+assert_eq "pane count still 3"           "$(_t list-panes -t work:2 | wc -l | tr -d ' ')" "3"
+assert_eq "layout still byte-identical"  "$(_t display-message -p -t work:2 '#{window_layout}')" "$LAYOUT_BEFORE"
+assert_eq "every state file is byte-identical" \
+  "$(for k in "$KEY1" "$KEY2" "$KEY3"; do cksum < "$(_state_path "$k")" 2>/dev/null; done)" "$SUMS_BEFORE"
+assert_eq "no extra state file was written" "$(_state_count)" "$STATES_BEFORE"
+assert_eq "no tombstone pane was respawned again" \
+  "$(_t list-panes -t work:2 -F '#{pane_pid}' | tr '\n' ' ')" "$TOMB_PIDS_BEFORE"
+assert_eq "tombstone titles unchanged" \
+  "$(_t list-panes -t work:2 -F '#{pane_title}' | tr '\n' '|')" "$TITLES_BEFORE"
 assert_eq "window indices still unchanged" \
   "$(_t list-windows -t work -F '#{window_index}:#{window_name}' | tr '\n' ' ')" "$WINDOWS_BEFORE"
-assert_eq "@cc-frozen claim unchanged" \
-  "$(_t show-options -w -t work:2 -v @cc-frozen 2>/dev/null)" "$KEY"
+
+# ...and the same is true of a bare PANE target, the new atom (§3.1 <target> ::= %N)
+OUT2b="$(_freeze freeze --no-save "$TP1" 2>/dev/null)"; RC2b=$?
+printf '    pane-target exit=%s stdout=[%s]\n' "$RC2b" "$OUT2b"
+assert_eq "freezing an already-frozen PANE by %%id exits 0" "$RC2b" "0"
+assert_eq "it reports ALREADY"                              "$(_col "$OUT2b" 1)" "ALREADY"
+assert_eq "it reports that pane's own key"                  "$(_col "$OUT2b" 3)" "$KEY1"
+assert_eq "a bare pane target emits no container summary"   "$(_nrows "$(_summary_rows "$OUT2b")")" "0"
 
 # A third call must be equally inert (idempotency is not a one-shot property).
 OUT3="$(_freeze freeze --no-save work:2 2>/dev/null)"; RC3=$?
-assert_eq "third freeze exits 0"          "$RC3" "0"
-assert_eq "third freeze reports ALREADY"  "$(_field "$OUT3" 1)" "ALREADY"
-assert_eq "state file still byte-identical" "$(cksum < "$SF" 2>/dev/null)" "$SUM_BEFORE"
+assert_eq "third freeze exits 0" "$RC3" "0"
+assert_eq "third freeze still reports ALREADY for every pane" \
+  "$(_pane_rows "$OUT3" | awk -F'\t' '$1!="ALREADY"' | grep -c . | tr -d ' ')" "0"
+assert_eq "state files still byte-identical" \
+  "$(for k in "$KEY1" "$KEY2" "$KEY3"; do cksum < "$(_state_path "$k")" 2>/dev/null; done)" "$SUMS_BEFORE"
 
 # ── 4. Freezing an unresolvable target must not damage anything ──────────────
 echo ""
@@ -491,6 +578,8 @@ assert_eq "exit code 2 for an unresolvable target" "$RC4" "2"
 assert_eq "no extra state file was written" "$(_state_count)" "$STATES_BEFORE"
 assert_eq "window list still unchanged" \
   "$(_t list-windows -t work -F '#{window_index}:#{window_name}' | tr '\n' ' ')" "$WINDOWS_BEFORE"
+assert_eq "layout still unchanged" \
+  "$(_t display-message -p -t work:2 '#{window_layout}')" "$LAYOUT_BEFORE"
 
 echo ""
 echo "=================================================================="

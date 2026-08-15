@@ -27,6 +27,15 @@
 
 set -uo pipefail
 
+# ── RESURRECT SAVE-SIDE ISOLATION ────────────────────────────────────────────
+# RESURRECT_FILE redirects resurrect READS. Only @resurrect-dir redirects its
+# WRITES. A test that triggers a save without setting it deposits fixture
+# snapshots in the user's live resurrect directory and can leave `last`
+# pointing at one. See tests/lib/resurrect_guard.sh for the measured damage.
+. "$(cd "$(dirname "$0")" && pwd)/lib/resurrect_guard.sh" || {
+  echo "ABORT: tests/lib/resurrect_guard.sh is missing"; exit 1; }
+cc_register_test_session _seed work legacy alpha beta lvl cA cB cC cD cE
+
 SOCKET="ccwr$$"
 QD="/tmp/ccwr-pend-$$"
 RD="/tmp/ccwr-res-$$"
@@ -46,7 +55,10 @@ _teardown() {
   _tmux kill-server 2>/dev/null
   rm -rf "$QD" "$RD" "$LOG" "$CANARY"
 }
-trap _teardown EXIT
+# Re-wrap the teardown so a leak into the real resurrect dir fails the run
+# even on the early-abort paths that never reach the final assertions.
+_cc_teardown_guarded() { _teardown; cc_warn_on_resurrect_leak || exit 1; }
+trap _cc_teardown_guarded EXIT
 
 mkdir -p "$QD" "$RD"
 
@@ -123,6 +135,10 @@ _tmux select-pane -t "$p9" -T "typed-pane"
 # Real cwd as tmux reports it (/tmp is a symlink to /private/tmp on macOS).
 cwd="$(_tmux list-panes -t "$p1" -F '#{pane_current_path}')"
 
+# The SAVE side. Without this, any save resurrect performs lands in the user's
+# live directory: helpers.sh defaults there whenever the option is unset.
+_tmux set-option -g @resurrect-dir "$RD"
+cc_guard_resurrect_dir "$RD" tmux -L "$SOCKET"
 _tmux set-option -g @claude-continuity-claude-cmd "echo"
 _tmux set-option -g @claude-continuity-pending-dir "$QD"
 _tmux set-option -g @claude-continuity-log-file "$LOG"

@@ -29,9 +29,23 @@ TD="/tmp/ccwd-$$"
 PD="$TD/panes"
 LD="$TD/launch"
 BIN="$TD/bin"
+RD="$TD/resurrect"
 SNAP="$TD/snapshot.txt"
 SCRIPT_DIR="$(cd "$(dirname "$0")/../scripts" && pwd)"
 PRE_SAVE="$SCRIPT_DIR/pre_save.sh"
+
+# THIS TEST WAS WRITING INTO THE USER'S LIVE RESURRECT DIRECTORY.
+# It invokes pre_save.sh six times; pre_save triggers a resurrect save, and
+# resurrect resolves its output dir from @resurrect-dir on the server it is
+# talking to — here, via the PATH shim below, the TEST server. That option was
+# never set, so every run saved into ~/.local/share/tmux/resurrect. See
+# tests/lib/resurrect_guard.sh for the measured damage. Redirecting the RESTORE
+# side is not enough: RESURRECT_FILE covers reads, @resurrect-dir covers writes.
+. "$(cd "$(dirname "$0")" && pwd)/lib/resurrect_guard.sh" || {
+  echo "ABORT: tests/lib/resurrect_guard.sh is missing — refusing to run a save-side test unguarded"
+  exit 1
+}
+cc_register_test_session work
 
 pass=0
 fail=0
@@ -41,10 +55,11 @@ _tmux() { tmux -L "$SOCKET" -f /dev/null "$@"; }
 _teardown() {
   tmux -L "$SOCKET" kill-server 2>/dev/null
   rm -rf "$TD"
+  cc_warn_on_resurrect_leak
 }
 trap _teardown EXIT INT TERM
 
-mkdir -p "$PD/by-pid" "$LD" "$BIN"
+mkdir -p "$PD/by-pid" "$LD" "$BIN" "$RD"
 
 ok()   { echo "  PASS: $1"; pass=$((pass+1)); }
 bad()  { echo "  FAIL: $1"; [ $# -gt 1 ] && echo "    $2"; fail=$((fail+1)); }
@@ -68,6 +83,12 @@ chmod +x "$BIN/tmux"
 _tmux new-session -d -s work "sh -c 'sh -c \"sleep 600; :\"; :'"
 _tmux set-option -g @claude-continuity-panes-dir "$PD" >/dev/null
 _tmux set-option -g @claude-continuity-launch-dir "$LD" >/dev/null
+# The save side. Set on the SERVER, because that is where resurrect reads it.
+_tmux set-option -g @resurrect-dir "$RD" >/dev/null
+# Pre-flight: ask the server what it will actually use, and refuse to run if the
+# answer is the user's real directory. A test that CAN write there should abort,
+# not hope.
+cc_guard_resurrect_dir "$RD" tmux -L "$SOCKET" -f /dev/null
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   PANE_PID="$(_tmux list-panes -t work -F '#{pane_pid}' 2>/dev/null | head -1)"
@@ -216,6 +237,27 @@ echo "44444444-4444-4444-8444-444444444444" > "$PD/by-pid/$$.session-id"
 write_snapshot
 PATH="$BIN:$PATH" bash "$PRE_SAVE" "$SNAP"
 assert_eq "no SID embedded for a non-pane process" "$(sid_in_snapshot)" ""
+
+# ── The save side actually stayed inside the sandbox ─────────────────────────
+echo "[6] ISOLATION: six saves, none of them in the user's real resurrect dir"
+if cc_assert_no_resurrect_leak; then
+  ok "no snapshot naming this test's sessions reached $CC_REAL_RESURRECT"
+else
+  bad "a snapshot naming this test's sessions reached the user's real resurrect dir" \
+      "see the LEAKED list above"
+fi
+# The leak check is only worth having if it CAN fail — prove the detector fires
+# on a planted fixture before believing it when it says "clean".
+if cc_selftest_leak_detector "$TD"; then
+  ok "the leak detector fires on a planted snapshot (the check above is not vacuous)"
+else
+  bad "the leak detector fires on a planted snapshot" \
+      "it found nothing in a directory that definitely contains a 'work' snapshot"
+fi
+# ...and the redirect is still in force at the end, so any save this test may
+# have triggered asynchronously could only have landed inside the sandbox.
+assert_eq "the server still reports the redirected @resurrect-dir" \
+  "$(_tmux show-options -gv @resurrect-dir 2>/dev/null)" "$RD"
 
 echo "=================================================================="
 echo "  RESULT: $pass passed, $fail failed"
