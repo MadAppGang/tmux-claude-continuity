@@ -25,7 +25,10 @@
 # action runs without an explicit keystroke (FR4.7): fzf is started
 # --no-select-1 --no-exit-0 so a single match can never auto-fire, Enter is
 # EXPAND (navigation, not an action), and every multi-pane or irreversible
-# gesture additionally requires a typed confirmation.
+# gesture additionally requires a confirmation — a two-line CONFIRM list whose
+# affirmative names the exact count, whose cursor starts on Cancel, and which is
+# SELECTED rather than typed (_cc_confirm, and the note above it on why this is
+# not a tmux display-menu).
 #
 # ── stdout of --list is a CONTRACT ───────────────────────────────────────────
 # One line per NODE, in depth-first order: a session row, then each of its
@@ -182,13 +185,27 @@ _cc_glyphs_init() {
     _CC_G_DOT="$(printf '\xc2\xb7')"        # ·
     _CC_G_ELL="$(printf '\xe2\x80\xa6')"    # …
     _CC_G_PIN="$(printf '\xe2\x97\x86')"    # ◆
+    _CC_G_BAR="$(printf '\xe2\x94\x82')"    # │ — the group divider in the stats line
   else
     # `~` is spoken for: it prefixes every memory figure. A partial marker that
     # reused it would read as a number, so ASCII partial is `o` — a half-filled
     # ring, the same idea as ◐ without the code points.
     _CC_G_OPEN='v'; _CC_G_SHUT='>'; _CC_G_SNOW='*'; _CC_G_PART='o'
-    _CC_G_DOT='.';  _CC_G_ELL='+'; _CC_G_PIN='#'
+    _CC_G_DOT='.';  _CC_G_ELL='+'; _CC_G_PIN='#'; _CC_G_BAR='|'
   fi
+  # fzf draws its own rules and labels. Left to itself it picks box characters
+  # from the locale, which is the one thing this init exists to override, so the
+  # decision made here is handed to it rather than made twice.
+  _CC_FZF_UNI=''
+  [ "$_CC_UTF8" = "1" ] || _CC_FZF_UNI='--no-unicode'
+  # A horizontal rule, sliced to width instead of built per call: the fzf UI
+  # gets its rules from fzf's own borders, but the no-fzf fallback draws its
+  # own, and `printf -v` + a global substitution costs no fork at all.
+  if [ "$_CC_UTF8" = "1" ]; then _CC_RULE_CH="$(printf '\xe2\x94\x80')"   # ─
+  else                           _CC_RULE_CH='-'
+  fi
+  printf -v _CC_RULE '%120s' ''
+  _CC_RULE="${_CC_RULE// /$_CC_RULE_CH}"
 }
 _cc_glyphs_init
 
@@ -635,6 +652,37 @@ _cc_inventory_cached() {
 # forks per redraw, and a redraw happens on every expand keystroke. The render
 # loop below runs with ZERO forks (NFR5).
 _CC_SPACES='                                                                                '
+
+# ── THE COLUMN GEOMETRY, DECLARED ONCE ───────────────────────────────────────
+# A column header that does not line up with its data is worse than no header at
+# all, so there is exactly ONE place where a width is written down. The header
+# row and every data row at every level are built by the same two padding
+# helpers from these four numbers; the label column takes what is left. Nothing
+# below may hard-code a width — that is how a header drifts from its data.
+#
+#   label(labw)  count/cmd(10)  memory(8)  idle/sid(9)  state(16)
+#
+# Each width is the widest value it must hold PLUS one space, because these are
+# right-aligned columns and two adjacent full-width cells would touch: the data
+# is ragged enough to hide that, but the header row is not — "MEMORYIDLE/SID"
+# is what an 8-wide idle column produces, and it is unreadable.
+#
+# STATE is 16 because that is what the widest honest state cell needs —
+# "◐ PARTIAL 12/34" is 15 — plus that one space. Truncating it to
+# "◐ PARTIAL 12…" would hide the n/m, which is the one figure a PARTIAL row
+# exists to show, and at 15 it touched the idle column beside it.
+_CC_W_CNT=10
+_CC_W_MEM=8
+_CC_W_AUX=9
+_CC_W_ST=16
+
+_cc_rule() {       # <width> — a horizontal rule, on stdout
+  local w="${1:-60}"
+  case "$w" in ''|*[!0-9]*) w=60 ;; esac
+  [ "$w" -gt 120 ] && w=120
+  printf '%s' "${_CC_RULE:0:$w}"
+}
+
 _cc_rpad() {       # <var> <string> <width>   left-aligned, ellipsised
   local s="$2" w="$3"
   if [ "$w" -lt 1 ]; then s=""
@@ -654,9 +702,27 @@ _cc_lpad() {       # <var> <string> <width>   right-aligned
   printf -v "$1" '%s' "$s"
 }
 
-# The state rail: the rightmost 13 columns of every row, so state reads straight
-# down one vertical line. PARTIAL carries its own glyph AND its n/m AND a colour
-# because it is the state that means "look here".
+# A right-aligned COLUMN cell: one guaranteed leading space, then the value
+# padded into what is left. That space is structural, not decoration. Both
+# _cc_rpad and _cc_lpad fill their width exactly when the value is long enough
+# to be ellipsised, so two adjacent full cells touch — and the two that fill
+# most often sit next to each other:
+#
+#   deploy (was ops:12)legacy-wi…        ← what the label and the command did
+#   deploy (was ops:12) legacy-w…        ← what a column that owns its gap does
+#
+# Ragged data hides this (most cells are short); the column header row, where
+# every cell is near its width, does not. So the gap belongs to the geometry.
+_cc_col() {        # <var> <string> <width>
+  local w=$(($3 - 1))
+  [ "$w" -lt 1 ] && w=1
+  _cc_lpad "$1" "$2" "$w"
+  printf -v "$1" ' %s' "${!1}"
+}
+
+# The state rail: the rightmost $_CC_W_ST columns of every row, so state reads
+# straight down one vertical line. PARTIAL carries its own glyph AND its n/m AND
+# a colour because it is the state that means "look here".
 _cc_state_cell() { # <var> <state> <frozen> <total>
   local txt col pad
   case "$2" in
@@ -668,7 +734,7 @@ _cc_state_cell() { # <var> <state> <frozen> <total>
     ORPHAN)   txt="! ORPHAN";                         col="$_CC_C_ORPH" ;;
     *)        txt="$2";                               col="" ;;
   esac
-  _cc_lpad pad "$txt" 13
+  _cc_col pad "$txt" "$_CC_W_ST"
   printf -v "$1" '%s' "$col$pad$_CC_C_OFF"
 }
 
@@ -700,10 +766,19 @@ _cc_idle_cell() {  # <var> <seconds>
   fi
 }
 
-# One rendered row. The three levels share the same column geometry — label,
-# then a 10/8/7 metrics block, then the state rail — so the memory figures line
-# up vertically across levels and the eye can scan one column, not three.
-#   left(label) | counts-or-cmd (10) | memory (8) | idle-or-sid (7) | state (13)
+# One rendered row, preceded by ONE column-header row. The three levels share
+# the same column geometry (_CC_W_*) — label, then the count/memory/aux block,
+# then the state rail — so the memory figures line up vertically across levels
+# and the eye can scan one column, not three:
+#
+#   label(labw) | count-or-cmd(10) | memory(8) | idle-or-sid(9) | state(16)
+#
+# THE FIRST LINE OUT OF HERE IS THE COLUMN HEADER, and fzf is told
+# `--header-lines=1`, which pins it above the list, out of the match set and out
+# of the selection. It is built by the same _cc_rpad/_cc_lpad calls, in the same
+# order, from the same four constants as the cells under it — so it cannot drift
+# from the data even when a width changes, and it survives the reload on every
+# expand keystroke because it is part of the render, not of the fzf command line.
 _cc_render() {     # reads $_CC_WORK/inv and $_CC_WORK/expanded
   local inv exp listw labw wcs
   local st sess widx wname idle rss pc sc key wid lev par node froz cmd sid flags label
@@ -713,8 +788,26 @@ _cc_render() {     # reads $_CC_WORK/inv and $_CC_WORK/expanded
   [ -f "$exp" ] || _cc_default_expansion > "$exp"
   listw="${CC_POPUP_LISTW:-76}"
   case "$listw" in ''|*[!0-9]*) listw=76 ;; esac
-  labw=$((listw - 13 - 26))
+  labw=$((listw - _CC_W_CNT - _CC_W_MEM - _CC_W_AUX - _CC_W_ST))
   [ "$labw" -lt 16 ] && labw=16
+
+  # The one row that names the columns. "SESSION / WINDOW / PANE" is the tree
+  # column's three levels, in the order they nest; below ~24 columns of label
+  # there is no room for that sentence and the honest short answer is NAME.
+  if [ "$labw" -ge 24 ]; then _cc_rpad cell "SESSION / WINDOW / PANE" "$labw"
+  else                        _cc_rpad cell "NAME" "$labw"
+  fi
+  disp="$cell"
+  _cc_col cell "COUNT/CMD" "$_CC_W_CNT"; disp="$disp$cell"
+  _cc_col cell "MEMORY"    "$_CC_W_MEM"; disp="$disp$cell"
+  _cc_col cell "IDLE/SID"  "$_CC_W_AUX"; disp="$disp$cell"
+  _cc_col cell "STATE"     "$_CC_W_ST";  disp="$disp$cell"
+  # Bold, never dim: this row has to stay readable on a light terminal, where
+  # grey-on-white is the first thing to disappear. Every field after the first
+  # is a placeholder — an empty one would collapse under `read` exactly as it
+  # would in the --list contract (FR6.2/L1).
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$_CC_C_BOLD$disp$_CC_C_OFF" '-' 'header' '-' '-' '-' '-' '-'
 
   # The expansion set and the per-session window counts, each as ONE string
   # matched with `case` — bash 3.2 has no associative arrays, and neither is
@@ -778,9 +871,9 @@ _cc_render() {     # reads $_CC_WORK/inv and $_CC_WORK/expanded
         ;;
     esac
 
-    _cc_lpad cell "$metric" 10;  disp="$lead$_CC_C_DIM$cell$_CC_C_OFF"
-    _cc_lpad cell "$mem" 8;      disp="$disp$cell"
-    _cc_lpad cell "$right" 8;    disp="$disp$_CC_C_DIM$cell$_CC_C_OFF"
+    _cc_col cell "$metric" "$_CC_W_CNT"; disp="$lead$_CC_C_DIM$cell$_CC_C_OFF"
+    _cc_col cell "$mem" "$_CC_W_MEM";    disp="$disp$cell"
+    _cc_col cell "$right" "$_CC_W_AUX";  disp="$disp$_CC_C_DIM$cell$_CC_C_OFF"
     _cc_state_cell cell "$st" "$froz" "$pc"
     disp="$disp$cell"
 
@@ -848,15 +941,26 @@ _cc_toggle() {     # <node id> — flip one node, then re-render
 
 # Expand/collapse must not move the cursor: a plain `reload()` re-seats it
 # somewhere else in the list (measured), and losing your place on every keypress
-# makes a 60-row tree unnavigable. fzf expands {n} — the cursor's 0-based index
-# — inside a `transform` binding, and a toggle only ever adds or removes rows
-# BELOW the toggled row, so its index is unchanged: this prints the reload and
-# the seat back to fzf as one action.
+# makes a 60-row tree unnavigable. fzf expands {n} inside a `transform` binding,
+# and a toggle only ever adds or removes rows BELOW the toggled row, so the
+# cursor's index is unchanged: this prints the reload and the seat back to fzf
+# as one action.
+#
+# {n} IS AN INDEX INTO THE INPUT STREAM, NOT INTO THE ITEM LIST. Measured
+# against fzf 0.74.2: with --header-lines=1, the cursor on the SECOND item
+# reports {n}=2, not 1 — the header line is counted. pos() is 1-based over the
+# items alone, so the seat is {n} + 1 - (header lines), which is plain {n}
+# while there is exactly one of them. Getting this wrong is not a crash: every
+# expand quietly walks the cursor one row down the tree, which is precisely the
+# unnavigability this binding exists to prevent.
+_CC_HDR_LINES=1
 _cc_enter() {      # <cursor index> <node> → an fzf action list on stdout
-  local i="${1:-0}"
+  local i="${1:-0}" seat
   case "$i" in ''|*[!0-9]*) i=0 ;; esac
   _cc_toggle_set "${2:-}"
-  printf 'reload(bash %s --render)+pos(%d)' "$(_cc_shquote "$SELF")" "$((i + 1))"
+  seat=$((i + 1 - _CC_HDR_LINES))
+  [ "$seat" -lt 1 ] && seat=1
+  printf 'reload(bash %s --render)+pos(%d)' "$(_cc_shquote "$SELF")" "$seat"
 }
 
 # Ctrl-S, repurposed. "Freeze every window of this session" is redundant now
@@ -1025,22 +1129,40 @@ _cc_preview() {
 }
 
 # ── The `?` screen ───────────────────────────────────────────────────────────
-_cc_keys_screen() {
+# The strip above the list carries six keys; this carries all of them, plus what
+# the columns mean and what the states mean. It is longer than the popup is
+# tall — it always was — so it is SHOWN THROUGH fzf, which makes it scrollable
+# for free and returns on Enter or Esc. A help screen whose first line (the
+# keys) has scrolled off the top before it is drawn is not help.
+_cc_keys_text() {
   cat <<'KEYS'
 
   SLEEP MANAGER — session → window → pane
+
+  THE FULL KEY SET. The strip above the list carries the six you need
+  most; these are all of them.
 
     Enter      expand / collapse the highlighted session or window
     Right/Left expand / collapse
     Ctrl-F     freeze the selection      (every pane beneath it)
     Ctrl-W     wake the selection
-    Ctrl-D     discard a frozen entry              (typed confirmation)
+    Ctrl-D     discard a frozen entry                    (asks first)
     Ctrl-P     pin / unpin the window (a pin is never auto-frozen)
     Ctrl-S     scope: sessions only / + windows / everything expanded
-    Ctrl-A     freeze every idle candidate         (typed confirmation)
-    Ctrl-X     force past a safety rail, ONE pane  (typed confirmation)
+    Ctrl-A     freeze every idle candidate               (asks first)
+    Ctrl-X     force past a safety rail, ONE pane        (asks first)
     Ctrl-R     refresh
     Tab        multi-select        ?  this screen        Esc  quit
+
+  THE COLUMNS
+
+    SESSION / WINDOW / PANE   the tree — see the legend below
+    COUNT/CMD    a session's windows and panes, a window's panes and
+                 Claude sessions, a pane's command
+    MEMORY       what this node's process trees map — approximate
+    IDLE/SID     how long since the window was used; on a pane row,
+                 the first six characters of its Claude session id
+    STATE        see below; a PARTIAL row also carries its n/m
 
   Typing filters. Rows keep their tree order, so matching is fuzzy and
   unsorted: a short query such as "neon" will also match rows that merely
@@ -1051,7 +1173,9 @@ _cc_keys_screen() {
   THE ATOM IS A PANE. Whatever you highlight is expanded to the panes
   beneath it and de-duplicated, so selecting a session AND one of its
   panes freezes that pane exactly once. Anything touching more than one
-  pane asks you to type the pane count first.
+  pane opens a two-line CONFIRM list first — the affirmative line names
+  the exact number of panes, windows and sessions it will act on, the
+  cursor starts on Cancel, and `y` is the one-key yes.
 
   A freeze over more than one pane can PARTLY succeed, and that is a
   normal answer, not a failure: "2 of 3 panes frozen · 1 refused
@@ -1066,8 +1190,8 @@ _cc_keys_screen() {
     FROZEN     tombstone; this server claims the stored entry
     PARTIAL    a session or window with SOME of its panes frozen — n/m
                says how many. This is the state worth looking at.
-    DETACHED   a stored entry no live pane claims — wake it with
-               cc_thaw.sh thaw --into <session:index> <key>
+    DETACHED   a stored entry no live pane claims — Ctrl-W offers a list
+               of live panes to wake it into (D1: never guessed for you)
     FOREIGN    a stored entry owned by another live tmux server: untouchable
     ORPHAN     a tombstone whose state file is missing or unreadable
 
@@ -1082,7 +1206,30 @@ _cc_keys_screen() {
   Nothing on this screen acts without a keystroke.
 
 KEYS
-  local _x
+  # The legend is printed, not embedded: the glyph set is chosen from the locale
+  # (and forced to ASCII by CC_POPUP_ASCII=1), so a heredoc full of box
+  # characters would tell half the users the wrong thing.
+  printf '  LEGEND   %s open   %s shut   %s frozen   %s partly frozen   %s pinned\n\n' \
+    "$_CC_G_OPEN" "$_CC_G_SHUT" "$_CC_G_SNOW" "$_CC_G_PART" "$_CC_G_PIN"
+}
+
+_cc_keys_screen() {
+  local _x hdr
+  _cc_fzf_resolve
+  if [ -n "$_CC_FZF" ] && { : < /dev/tty; } 2>/dev/null; then
+    hdr="Up/Down and PgUp/PgDn scroll $_CC_G_DOT Enter or Esc goes back"
+    [ "$_CC_FZF_OWNRULE" = "1" ] && hdr="$hdr
+$(_cc_rule 74)"
+    _cc_keys_text | "$_CC_FZF" --layout=reverse --no-sort --no-multi \
+        --info=hidden --no-separator --pointer=' ' --prompt='' \
+        $_CC_FZF_UNI $_CC_FZF_INPUT ${_CC_FZF_FRAME[@]+"${_CC_FZF_FRAME[@]}"} \
+        --color=label:-1,header:-1 \
+        --border=top --border-label=' SLEEP MANAGER ' \
+        --header="$hdr" \
+        --bind='enter:abort' > /dev/null 2>&1
+    return 0
+  fi
+  _cc_keys_text
   printf '  Press Enter to go back. '
   _cc_read _x
 }
@@ -1110,6 +1257,10 @@ _cc_pause() {
   _cc_read _x
 }
 
+# The LAST-RESORT confirmation: no fzf, or no terminal to draw one on. It is
+# not the one a human sees — _cc_confirm below is — but it is what keeps FR4.7
+# true when there is nothing to draw a widget with, and an empty answer (no tty
+# at all) is a cancel.
 _cc_confirm_typed() {   # <word> <prompt...>
   local want="$1" ans=""
   shift
@@ -1117,6 +1268,147 @@ _cc_confirm_typed() {   # <word> <prompt...>
   printf '  Type %s to confirm (anything else cancels): ' "$want"
   _cc_read ans
   [ "$ans" = "$want" ]
+}
+
+# fzf, resolved once and remembered. $PATH inside a `display-popup` is the login
+# shell's, which on this machine has Homebrew on it — but a popup started from a
+# hook may not, so the known install location is the fallback before declaring
+# fzf absent.
+#
+# THREE OF THE FLAGS THE FRAME USES ARRIVED LATE in fzf's life — --header-border
+# (the rule under the header), --gutter (which turns off the U+258C bar 0.74
+# draws in front of every row) and --no-input. AN UNKNOWN LONG OPTION IS A HARD
+# ERROR: fzf prints "unknown option" and exits 2, so passing one unconditionally
+# would replace the manager with a usage message on every older install. Rather
+# than guess from a version table, THIS fzf is asked — `fzf <flags> --version`
+# parses the flags and exits 2 if it does not know one, which costs one fork,
+# once, per popup. The answer chooses between fzf's own frame and a rule drawn
+# by hand; both carry exactly the same information.
+_CC_FZF=''
+_CC_FZF_RESOLVED=0
+_CC_FZF_FRAME=()
+_CC_FZF_INPUT=''
+_CC_FZF_OWNRULE=0
+_cc_fzf_resolve() {
+  [ "$_CC_FZF_RESOLVED" = "1" ] && return 0
+  _CC_FZF_RESOLVED=1
+  _CC_FZF="$(command -v fzf 2>/dev/null)"
+  if [ -z "$_CC_FZF" ] && [ -x /opt/homebrew/bin/fzf ]; then _CC_FZF=/opt/homebrew/bin/fzf; fi
+  [ -n "$_CC_FZF" ] || return 0
+  if "$_CC_FZF" --header-border=bottom --gutter=' ' --no-input --version \
+       > /dev/null 2>&1; then
+    _CC_FZF_FRAME=(--header-border=bottom --gutter=' ')
+    _CC_FZF_INPUT='--no-input'
+  else
+    _CC_FZF_OWNRULE=1
+    _CC_FZF_INPUT='--disabled'
+  fi
+  return 0
+}
+# Every call site expands the frame as ${_CC_FZF_FRAME[@]+"${_CC_FZF_FRAME[@]}"}:
+# the outer form keeps an EMPTY array from tripping `set -u` on bash 3.2 (the
+# same guard the .state file list uses), and the inner quotes keep `--gutter= `
+# — a flag whose value IS a space — as one word.
+
+# ── The confirmation, as a widget ────────────────────────────────────────────
+# FR4.7: nothing here acts without an explicit gesture, and anything reaching
+# more than one pane tears down more than one process tree — so the gesture must
+# be deliberate. It does NOT have to be TYPING. The old one printed
+#
+#     Type 3 to confirm (anything else cancels):
+#
+# which is a command-line prompt wearing a TUI's clothes: it reads like an
+# error, offers no affordance, and asks the user to COMPOSE an answer where the
+# rest of this UI asks them to CHOOSE one. Same guarantee, wrong instrument.
+#
+# WHY NOT `tmux display-menu`, WHICH WOULD BE THE OBVIOUS ANSWER. Measured on
+# tmux 3.7b, from inside `display-popup -E`: display-menu exits 0, prints
+# nothing on stderr, AND DRAWS NOTHING. A client holds one overlay at a time and
+# the popup already is it. It is asynchronous besides — the answer comes back
+# through a tmux command, not through this shell — so even where it draws there
+# is nothing here to read. A confirmation that silently "succeeds" without ever
+# asking is the single worst thing this file could ship.
+#
+# So the widget is fzf, which is already the UI, already open on this tty,
+# synchronous, and whose stdout IS the answer. It selects by arrow key, by
+# single key, or by mouse.
+#
+# THE CURSOR STARTS ON CANCEL. Enter is EXPAND in the list this widget replaces,
+# so an Enter arriving out of habit must not freeze eight panes. The affirmative
+# is one deliberate move away — or the single key `y` — and it CARRIES THE
+# COUNT in its own text, because the count is the thing the user must register
+# before committing.
+_cc_confirm() {         # <fallback word> <affirmative label> <detail line...>
+  local word="$1" yes="$2" pick hdr l nl
+  shift 2
+  _cc_fzf_resolve
+  if [ -z "$_CC_FZF" ] || ! { : < /dev/tty; } 2>/dev/null; then
+    _cc_confirm_typed "$word" "$@"
+    return $?
+  fi
+  nl='
+'
+  hdr=''
+  for l in "$@"; do hdr="${hdr:+$hdr$nl}$l"; done
+  hdr="$hdr$nl${nl}Up/Down choose $_CC_G_DOT Enter commits $_CC_G_DOT y = yes $_CC_G_DOT Esc cancels"
+  # The two lines are Y/N-tagged and the tag is hidden (--with-nth=2), so the
+  # answer is read from a field that no amount of relabelling can change.
+  [ "$_CC_FZF_OWNRULE" = "1" ] && hdr="$hdr$nl$(_cc_rule 60)"
+  pick="$(printf 'Y\t%s\nN\t%s\n' "$yes" "Cancel  (nothing happens)" \
+    | "$_CC_FZF" --layout=reverse --no-multi --no-sort --no-separator \
+        --info=hidden --height='~100%' --ansi --prompt='' \
+        $_CC_FZF_UNI $_CC_FZF_INPUT ${_CC_FZF_FRAME[@]+"${_CC_FZF_FRAME[@]}"} \
+        --delimiter="$TAB" --with-nth=2 \
+        --pointer='>' --color=label:-1,header:-1 \
+        --border=top --border-label=' CONFIRM ' \
+        --header="$hdr" \
+        --bind='start:pos(2)' --bind='y:pos(1)+accept' \
+        --bind='n:abort' --bind='q:abort' 2>/dev/null)"
+  case "$pick" in Y"$TAB"*) return 0 ;; esac
+  return 1
+}
+
+# The one place a free-text answer was genuinely being asked for — "wake this
+# stored entry into WHICH window?" — is a choice too: the windows that exist are
+# knowable, and typing `work:2` from memory is how a user learns that window 2
+# was renumbered. Same widget, search enabled, because an estate has more than
+# two panes.
+_cc_pick_into() {       # <var> — sets it to a live pane id, or empty to cancel
+  local inv f out hdr
+  eval "$1=''"
+  _cc_fzf_resolve
+  inv="$(_cc_inventory_cached)"
+  f="$_CC_WORK/into"
+  # Fixed-width columns first and the free text LAST: awk pads by BYTES, and a
+  # UTF-8 window name in the middle would shear every column after it.
+  awk -F'\t' -v dot="$_CC_G_DOT" '
+    $11 == "pane" && $1 == "AWAKE" { printf "%s\t%-6s %-16s %s %s %s\n", $13, $13, $2 ":" $3, $4, dot, $18 }
+  ' "$inv" > "$f"
+  if [ ! -s "$f" ]; then
+    printf '  There is no live pane on this server to wake it into.\n'
+    return 1
+  fi
+  if [ -z "$_CC_FZF" ] || ! { : < /dev/tty; } 2>/dev/null; then
+    printf '  Wake it into which pane or window? (session:index, empty cancels): '
+    _cc_read "$1"
+    return 0
+  fi
+  hdr="Type to filter $_CC_G_DOT Enter wakes the entry into the highlighted pane $_CC_G_DOT Esc cancels"
+  [ "$_CC_FZF_OWNRULE" = "1" ] && hdr="$hdr
+$(_cc_rule 74)"
+  out="$("$_CC_FZF" --layout=reverse --no-multi --no-sort --no-separator \
+      --info=inline-right --height='~60%' --ansi $_CC_FZF_UNI \
+      ${_CC_FZF_FRAME[@]+"${_CC_FZF_FRAME[@]}"} \
+      --delimiter="$TAB" --with-nth=2 \
+      --pointer='>' --color=label:-1,header:-1 \
+      --prompt=' find a pane: ' \
+      --border=top --border-label=' WAKE INTO WHICH PANE? ' \
+      --header="$hdr" \
+      < "$f" 2>/dev/null)"
+  [ -n "$out" ] || return 0
+  out="${out%%$TAB*}"
+  eval "$1=\$out"
+  return 0
 }
 
 # ── The outcome, in a sentence ───────────────────────────────────────────────
@@ -1307,11 +1599,10 @@ _cc_act_freeze() {      # [--force]
   if [ "$n" -gt 1 ]; then
     awk -F'\t' '$1 == "AWAKE"' "$pf" > "$pf.a"
     scope="$(_cc_count_scope "$pf.a")"
-    _cc_confirm_typed "$n" \
-"  Freeze $scope.
-  Each pane still passes every rail inside cc_freeze.sh: a pane running
-  vim, or a Claude whose session id cannot be attributed, is REFUSED and
-  left running. Partial outcomes are normal and are reported per pane." || {
+    _cc_confirm "$n" "Freeze $scope" \
+"Each pane still passes every rail inside cc_freeze.sh: a pane running vim," \
+"or a Claude whose session id cannot be attributed, is REFUSED and left" \
+"running. Partial outcomes are normal, and are reported per pane." || {
       printf '  cancelled.\n'; return 0; }
   fi
   printf '  freezing %s pane(s)…\n\n' "$n"
@@ -1333,10 +1624,9 @@ _cc_act_thaw() {
   [ "${n:-0}" = "0" ] && { printf '  Nothing frozen in the selection.\n'; return 0; }
   if [ "$n" -gt 1 ]; then
     awk -F'\t' '$1 != "AWAKE"' "$pf" > "$pf.f"
-    _cc_confirm_typed "$n" \
-"  Wake $(_cc_count_scope "$pf.f").
-  Each pane is respawned with its recorded cwd and title, and its Claude
-  is queued for resume — $n resumes will start at once." || {
+    _cc_confirm "$n" "Wake $(_cc_count_scope "$pf.f")" \
+"Each pane is respawned with its recorded cwd and title, and its Claude is" \
+"queued for resume — $n resumes will start at once." || {
       printf '  cancelled.\n'; return 0; }
   fi
   set --
@@ -1345,10 +1635,11 @@ _cc_act_thaw() {
     case "$st" in
       AWAKE) continue ;;
       DETACHED)
-        # D1: an unclaimed entry is applied only to a window the user names.
+        # D1: an unclaimed entry is applied only to a pane the user names — and
+        # naming it is a choice from the panes that exist, not a string typed
+        # from memory against a server that may have renumbered since.
         printf '  %s is a stored entry no pane claims.\n' "$key"
-        printf '  Wake it into which window? (session:index, empty cancels): '
-        _cc_read into
+        _cc_pick_into into || continue
         [ -n "$into" ] || { printf '  cancelled.\n'; continue; }
         _cc_run thaw "$THAW_SH" thaw --into "$into" "$key"
         continue ;;
@@ -1384,10 +1675,9 @@ _cc_act_discard() {
     n=$((n + 1))
   done < "$pf"
   [ "$n" = "0" ] && { printf '  Nothing frozen in the selection.\n'; return 0; }
-  _cc_confirm_typed discard \
-"  Discard $n stored entry(ies). No pane is touched and nothing is killed
-  — the stored intent is archived and its session ids stop being offered
-  for a wake. They remain in the freeze log." || {
+  _cc_confirm discard "Discard $n stored $([ "$n" = 1 ] && printf entry || printf entries)" \
+"No pane is touched and nothing is killed — the stored intent is archived and" \
+"its session ids stop being offered for a wake. They remain in the freeze log." || {
     printf '  cancelled.\n'; return 0; }
   _cc_run discard "$THAW_SH" discard --yes "$@"
   return 0
@@ -1485,9 +1775,9 @@ _cc_act_all_idle() {
     ($11 == "pane") && ($13 in C) { printf "    %-6s %s:%s  %-24.24s %s\n", $13, $2, $3, $18, $1 }
   ' "$cands" "$inv" | head -n 40
   printf '\n'
-  _cc_confirm_typed "$n" \
-"  Freeze the $n pane(s) above. Each still passes every rail inside
-  cc_freeze.sh; anything unsafe is REFUSED and left running." || {
+  _cc_confirm "$n" "Freeze the $n idle pane$([ "$n" = 1 ] || printf s) listed above" \
+"Each still passes every rail inside cc_freeze.sh; anything unsafe is REFUSED" \
+"and left running. This is the widest gesture in the UI." || {
     printf '  cancelled.\n'; return 0; }
   set --
   while IFS= read -r t; do [ -n "$t" ] && set -- "$@" "$t"; done < "$cands"
@@ -1540,18 +1830,25 @@ _cc_act_force() {
       printf '  hook (doctor.sh section 3) or resolve the duplicate first.\n'
       return 0 ;;
   esac
-  _cc_confirm_typed force \
-"  Override for pane $node — rail: $reason
-  Forcing kills that process along with the rest of the pane's tree.
-  Unsaved work in it is lost. This applies to ONE pane: $node." || {
+  _cc_confirm force "Force past the rail and freeze pane $node anyway" \
+"Rail: $reason" \
+"" \
+"Forcing kills that process along with the rest of the pane's tree, and any" \
+"unsaved work in it is lost. This applies to ONE pane: $node." || {
     printf '  cancelled.\n'; return 0; }
   _cc_run freeze "$FREEZE_SH" freeze --reason manual --force "$node"
   return 0
 }
 
 # ── The UI ───────────────────────────────────────────────────────────────────
+# The chrome above the list, as THREE separate lines with three separate jobs —
+# never again as one wall of dots. Line 1 is the fzf border label (a title
+# belongs in the window's own frame); line 2 is the two figures that decide
+# whether to act, in two labelled groups divided by a rule; line 3 is the short
+# key strip. The caller reads them back one line at a time, so nothing here may
+# wrap or reorder.
 _cc_header() {          # <inventory file> <threshold> [counts-only]
-  awk -F'\t' -v t="$2" -v conly="${3:-}" '
+  awk -F'\t' -v t="$2" -v conly="${3:-}" -v dot="$_CC_G_DOT" -v bar="$_CC_G_BAR" '
     $11 == "session" { ns++; next }
     $11 == "window"  { nw++; next }
     $11 == "pane" {
@@ -1565,23 +1862,36 @@ _cc_header() {          # <inventory file> <threshold> [counts-only]
       if (b > 0)           return sprintf("~%dK", b / 1024)
       return "nothing"
     }
+    function pl(n, w) { return sprintf("%d %s%s", n, w, (n == 1) ? "" : "s") }
     END {
-      printf "%d sessions · %d windows · %d panes · %d frozen · %d idle · %s reclaimable · %s held (approx)\n",
-             ns + 0, nw + 0, np + 0, froz + 0, idle + 0, h(recl + 0), h(held + 0)
+      # 1 — the title bar. The estate is context, not a decision, so it rides in
+      # the border label where it costs no line of its own.
+      printf " sleep manager  %s  %s  %s  %s  %s  %s \n",
+             dot, pl(ns + 0, "session"), dot, pl(nw + 0, "window"), dot, pl(np + 0, "pane")
+      # 2 — what is asleep, and what could be. "none" rather than "0 panes
+      # nothing held": a zero deserves one word, not a row of noughts.
+      printf "%s   %s   %s\n",
+             (froz > 0) ? sprintf("frozen  %s  %s held", pl(froz, "pane"), h(held + 0)) \
+                        : "frozen  none",
+             bar,
+             (idle > 0) ? sprintf("idle  %s  %s reclaimable", pl(idle, "pane"), h(recl + 0)) \
+                        : "idle  none"
       if (conly != "") exit         # the read-only fallback: no keys to offer
-      printf "Enter expand · C-F freeze · C-W wake · C-D discard · C-P pin\n"
-      printf "C-S scope · C-A all idle · C-X force · C-R refresh · Tab select · ? help"
+      # 3 — six keys, not eleven. C-D, C-A, C-X, C-R and Tab are one `?` away,
+      # and a key strip that wraps to two lines is a wall, not a reminder.
+      printf "Enter expand %s C-F freeze %s C-W wake %s C-P pin %s C-S scope %s ? all keys\n",
+             dot, dot, dot, dot, dot
     }
   ' "$1"
 }
 
 _cc_ui() {
-  local inv lines out key thr fzf cols pw listw
-  # $PATH inside a `display-popup` is the login shell's, which on this machine
-  # has Homebrew on it — but a popup started from a hook may not, so the known
-  # install location is the fallback before declaring fzf absent.
-  fzf="$(command -v fzf 2>/dev/null)"
-  if [ -z "$fzf" ] && [ -x /opt/homebrew/bin/fzf ]; then fzf=/opt/homebrew/bin/fzf; fi
+  local inv lines out key thr fzf cols pw listw hlabel h1 h2
+  # One resolver for the whole file: the list, the confirmation and the `?`
+  # pager all need the same fzf, and each looking it up again would be three
+  # PATH searches for an answer that cannot change inside one popup.
+  _cc_fzf_resolve
+  fzf="$_CC_FZF"
   inv="$_CC_WORK/inv"; lines="$_CC_WORK/lines"; out="$_CC_WORK/out"
   thr="$(_cc_threshold)"
 
@@ -1611,10 +1921,17 @@ _cc_ui() {
 
   if [ -z "$fzf" ]; then
     # F20: the CLI stays fully usable, so this is a degradation, not a failure.
+    # The same three-part chrome, drawn by hand because there is no fzf frame to
+    # hang it on: title, figures, rule, then the tree under its column header
+    # (which _cc_render emits as its own first line, here as everywhere else).
     _cc_inventory > "$inv"
-    printf '\n  SLEEP MANAGER (fzf is not installed — read-only tree)\n\n'
+    _cc_header "$inv" "$thr" counts > "$_CC_WORK/hdr"
+    { IFS= read -r hlabel; IFS= read -r h1; } < "$_CC_WORK/hdr"
+    printf '\n %s  (fzf is not installed — read-only tree)\n\n' "$hlabel"
+    printf '  %s\n' "$h1"
+    printf '  %s\n' "$(_cc_rule "$listw")"
     _CC_PLAIN=1 _cc_render | cut -f1 | sed 's/^/  /'
-    printf '\n  %s\n\n' "$(_cc_header "$inv" "$thr" counts)"
+    printf '\n'
     printf '  Install fzf for the interactive manager:  brew install fzf\n'
     printf '  Meanwhile: %s freeze <pane|window|session>\n' "$FREEZE_SH"
     printf '             %s thaw   <pane|window>\n\n' "$THAW_SH"
@@ -1633,14 +1950,69 @@ _cc_ui() {
     [ -f "$_CC_WORK/expanded" ] || _cc_default_expansion > "$_CC_WORK/expanded"
     _cc_render > "$lines"
 
+    # COLOUR, AND THE LIGHT TERMINAL. fzf's defaults are a dark-background
+    # scheme and it only switches when $COLORFGBG says otherwise, which iTerm2
+    # does not set. Measured with `capture-pane -e`, the defaults paint the
+    # border LABEL in 256-colour 145 (#afafaf) and the header in 109 (#87afaf):
+    # on a white terminal the title is all but invisible and the header is a
+    # wash. Both are pinned to -1, the terminal's OWN foreground, which is
+    # legible on any background by construction — structure here is carried by
+    # rules, alignment and weight, never by hue. The gutter is turned off for
+    # the same reason: fzf draws it as U+258C in colour 236 (#303030), a
+    # near-black bar in front of every single row of a light-background tree.
+    #
+    # The three header lines, read back without a fork apiece. They are three
+    # separate strings because they go to three separate places in the frame.
+    _cc_header "$inv" "$thr" > "$_CC_WORK/hdr"
+    { IFS= read -r hlabel; IFS= read -r h1; IFS= read -r h2; } < "$_CC_WORK/hdr"
+    # An fzf too old for --header-border still gets the rule: one more header
+    # line, drawn here. The separation between chrome and list is the point of
+    # it, and that must not depend on which fzf is installed.
+    [ "$_CC_FZF_OWNRULE" = "1" ] && h2="$h2
+$(_cc_rule "$listw")"
+
+    # THE FRAME, top to bottom — captured, not sketched:
+    #
+    #  ──────────── sleep manager  ·  4 sessions  ·  5 windows  ·  12 panes ────────────
+    #   filter:                                                              16/16 (0)
+    #    frozen  4 panes  ~7M held   │   idle  8 panes  ~11M reclaimable
+    #    Enter expand · C-F freeze · C-W wake · C-P pin · C-S scope · ? all keys
+    #    SESSION / WINDOW / PANE         COUNT/CMD  MEMORY IDLE/SID           STATE
+    #  ─────────────────────────────────────────────────────────────────────────────────
+    #  ▾ aniflow                           1w · 3p     ~5M       4d           AWAKE
+    #      ▾ aniflow:1  aniflow features        3p     ~5M       4d           AWAKE
+    #            %1    bash                   bash     ~1M                    AWAKE
+    #
+    # Six rows of chrome — a title, the figures, the keys, the column names and
+    # two rules — where the old header was four rows of which three were an
+    # undifferentiated wall of dots. Every one of the six now says which of
+    # those things it is. `--border=top` and `--header-border=bottom` are one
+    # row each and, unlike a full box, add NO left/right frame: a side border
+    # would indent the header block by two columns and shear it away from the
+    # list it names, which is the whole point of having a column header at all.
+    #
+    # The title is in the border label because the prompt is the wrong place for
+    # one: it is a slot fzf owns, shares with the query and the counts, and
+    # clips (the reported "leep>"). What is left in the prompt says only what
+    # typing does, and it starts with a space, so no clip can eat a letter.
+    #
     # Column 1 is the only visible/searchable field; 2..8 ride along for the
     # actions and the preview (--with-nth=1 hides them). --no-hscroll with an
     # empty --ellipsis is what keeps the search tail off the screen.
+    # --header-lines=1 takes the column header off the top of the render: it is
+    # pinned, unmatchable and unselectable, and fzf indents it by exactly the
+    # pointer gutter — the same indent every item gets — which is what makes the
+    # names sit over their own columns.
     "$fzf" --multi --no-sort --no-select-1 --no-exit-0 --cycle --layout=reverse \
            --ansi --no-hscroll --ellipsis='' \
-           --delimiter="$TAB" --with-nth=1 \
-           --prompt='sleep> ' --info=inline --pointer='>' --marker='+' \
-           --header="$(_cc_header "$inv" "$thr")" \
+           --delimiter="$TAB" --with-nth=1 --header-lines="$_CC_HDR_LINES" \
+           --prompt=' filter: ' --info=inline-right --no-separator \
+           --pointer='>' --marker='+' $_CC_FZF_UNI \
+           ${_CC_FZF_FRAME[@]+"${_CC_FZF_FRAME[@]}"} \
+           --color=label:-1,header:-1 \
+           --border=top --border-label="$hlabel" \
+           --header="$h1
+$h2" \
            --preview="bash '$SELF' --preview {}" \
            --preview-window="$pw" \
            --bind="?:execute(bash '$SELF' --keys)" \
