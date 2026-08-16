@@ -989,19 +989,40 @@ _cc_container_line() {
 # ── One save request per invocation (§3.1.13) ────────────────────────────────
 # v1 issued one per target; with nothing locking resurrect's save, concurrent
 # save.sh runs race `ln -fs … last` and the winner can be a pre-freeze dump.
+# Every unattended `run-shell -b` below redirects the JOB's own output, inside
+# the command string. The trailing `2>/dev/null` on the tmux invocation is NOT
+# the same thing and does not help: it silences the tmux CLIENT's stderr, while
+# the job runs inside the SERVER and its stdout is handed to tmux, which prints
+# it to whichever client requested the job.
+#
+# That path killed a server on 2026-08-16: tmux 3.7b segfaulted in
+# cmd_run_shell_print -> server_client_print -> proc_send (SIGSEGV, null deref
+# at 0xa4) delivering a finished job's output to a client that had gone away,
+# taking 16 sessions with it and truncating the resurrect save that was in
+# flight. `-b` makes it likelier, not safer — a backgrounded job outlives the
+# client that asked for it, which is exactly the setup for that deref.
+#
+# `|| true` is not redundant with the redirect: tmux synthesises its own
+# "returned 1" line for a non-zero job, and that line goes through the same
+# print path. A job that emits nothing and never fails cannot enter it at all.
+#
+# CC_SAVE_CMD is wrapped in ( ) rather than { } deliberately. A brace group is
+# not a subshell, so an `exit N` inside CC_SAVE_CMD terminates the whole
+# `sh -c` and `|| true` never runs — verified: tmux still printed
+# "... returned 3". A subshell contains the exit and `|| true` catches it.
 _cc_request_save() {
   local s
   [ "$NO_SAVE" = "1" ] && return 0
   [ "${CC_NO_SAVE:-0}" = "1" ] && return 0
   if [ -n "${CC_SAVE_CMD:-}" ]; then
-    $TMUX_CMD run-shell -b "$CC_SAVE_CMD" 2>/dev/null
+    $TMUX_CMD run-shell -b "( $CC_SAVE_CMD ) >/dev/null 2>&1 || true" 2>/dev/null
     return 0
   fi
   for s in "$CURRENT_DIR/../../tmux-resurrect/scripts/save.sh" \
            "$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh" \
            "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/plugins/tmux-resurrect/scripts/save.sh"; do
     if [ -x "$s" ]; then
-      $TMUX_CMD run-shell -b "$s" 2>/dev/null
+      $TMUX_CMD run-shell -b "'$s' >/dev/null 2>&1 || true" 2>/dev/null
       _cc_log "SAVE-REQUESTED $s"
       return 0
     fi

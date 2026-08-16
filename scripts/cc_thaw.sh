@@ -863,11 +863,11 @@ _cc_request_save() {
   local s
   [ "$NO_SAVE" = "1" ] && return 0
   [ "${CC_NO_SAVE:-0}" = "1" ] && return 0
-  if [ -n "${CC_SAVE_CMD:-}" ]; then $TMUX_CMD run-shell -b "$CC_SAVE_CMD" 2>/dev/null; return 0; fi
+  if [ -n "${CC_SAVE_CMD:-}" ]; then $TMUX_CMD run-shell -b "( $CC_SAVE_CMD ) >/dev/null 2>&1 || true" 2>/dev/null; return 0; fi
   for s in "$CURRENT_DIR/../../tmux-resurrect/scripts/save.sh" \
            "$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh" \
            "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/plugins/tmux-resurrect/scripts/save.sh"; do
-    [ -x "$s" ] && { $TMUX_CMD run-shell -b "$s" 2>/dev/null; _cc_log "SAVE-REQUESTED $s"; return 0; }
+    [ -x "$s" ] && { $TMUX_CMD run-shell -b "'$s' >/dev/null 2>&1 || true" 2>/dev/null; _cc_log "SAVE-REQUESTED $s"; return 0; }
   done
   _cc_log "SAVE-UNAVAILABLE: no tmux-resurrect save.sh found"
   return 0

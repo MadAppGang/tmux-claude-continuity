@@ -301,7 +301,7 @@ _cc_kick_sweep() {
   [ "$(_cc_opt @claude-continuity-autofreeze off)" = "on" ] || return 0
   script="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/cc_freeze.sh"
   [ -x "$script" ] || return 0
-  $TMUX_CMD run-shell -b "'$script' sweep" 2>/dev/null || true
+  $TMUX_CMD run-shell -b "'$script' sweep >/dev/null 2>&1 || true" 2>/dev/null || true
 }
 
 if [ -n "$_CC_STORE_NS" ] && type cc_ledger_tick >/dev/null 2>&1; then
