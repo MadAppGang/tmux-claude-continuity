@@ -1032,11 +1032,85 @@ _cc_count_scope() {   # <panes file> → "8 panes across 4 windows in 2 sessions
   ' "$1"
 }
 
+# ── The exact command that puts a pane back ──────────────────────────────────
+# FR: a row must show what will actually run, awake or frozen.
+#
+# This calls cc_compose_relaunch_kv — the SAME function post_restore.sh and a
+# thaw use — rather than formatting a plausible-looking string. A reconstruction
+# would drift the moment the composition rules change (claudish replay, typed
+# capture, session-flag stripping), and a restore command that is subtly not the
+# real one is worse than none: it invites you to paste it.
+#
+# Returns "kind<TAB>command". The kind explains WHICH rule won:
+#   typed:…        the command you actually typed, from the preexec capture
+#   replay:…       reconstructed from the live process, wrapper preserved
+#   default+args:… the configured launcher plus this pane's own arguments
+#   claudish:[…]   relaunched through claudish so the provider is rebuilt
+#   default        the configured launcher, nothing pane-specific known
+_cc_restore_cmd_kv() {   # <full_cmd> <typed_b64> <sid> <claudish_replay>
+  local base claudish
+  base="$($TMUX_CMD show-option -gqv @claude-continuity-claude-cmd 2>/dev/null)"
+  claudish="$($TMUX_CMD show-option -gqv @claude-continuity-claudish-cmd 2>/dev/null)"
+  cc_compose_relaunch_kv "${base:-claude}" "${claudish:-claudish}" "$2" "$1" "$4" "$3"
+}
+
+# The typed command for a LIVE pane, as captured by the preexec hook. Same file
+# a freeze reads, so an awake row previews the input its own freeze would use.
+_cc_live_typed_b64() {   # <%N>
+  local f
+  f="$(_cc_opt @claude-continuity-launch-dir "$HOME/.config/tmux-claude/launch")/${1#%}"
+  [ -f "$f" ] || return 1
+  _cc_b64 < "$f"
+}
+
+# The live full command: the deepest descendant of the pane that looks like a
+# Claude launcher, else the pane's own process. One ps, filtered in awk — see
+# cc_proc_rss_sum for why `ps -p <list>` is avoided on this platform.
+_cc_live_full_cmd() {    # <%N>
+  local pid
+  pid="$($TMUX_CMD display-message -p -t "$1" '#{pane_pid}' 2>/dev/null)"
+  case "${pid:-}" in ''|*[!0-9]*) return 1 ;; esac
+  ps -axo pid=,ppid=,command= 2>/dev/null | awk -v root="$pid" '
+    { c = $0; sub(/^[ ]*[0-9]+[ ]+[0-9]+[ ]+/, "", c); cmd[$1] = c; par[$1] = $2 }
+    END {
+      best = ""; own = cmd[root]
+      for (p in cmd) {
+        q = p; d = 0
+        while (q != "" && q != "0" && q != "1" && d < 16) {
+          if (q == root) { if (cmd[p] ~ /claude|claudish/) best = cmd[p]; break }
+          q = par[q]; d++
+        }
+      }
+      print (best != "" ? best : own)
+    }'
+}
+
+# Render the restore block. Wrapped at the preview width so a long `op run …`
+# line stays readable instead of being truncated by fzf.
+_cc_restore_block() {    # <kind> <cmd> <trailing note...>
+  local kind="$1" cmd="$2" w; shift 2
+  # Width from the pane fzf actually gave us, not a guess: this block exists to
+  # be READ and copied, and a command silently clipped at the right edge is the
+  # one failure this feature cannot afford.
+  w="${FZF_PREVIEW_COLUMNS:-${COLUMNS:-58}}"
+  case "$w" in ''|*[!0-9]*) w=58 ;; esac
+  [ "$w" -lt 24 ] && w=24
+  printf '\n  %sRESTORE COMMAND%s  %s%s%s\n' \
+    "$_CC_C_BOLD" "$_CC_C_OFF" "$_CC_C_DIM" "${kind%%:*}" "$_CC_C_OFF"
+  printf '  %s\n' "$(_cc_rule $((w - 4)))"
+  # printf '%s\n', not '%s': fold emits no trailing newline, so without it the
+  # note below lands on the end of the last wrapped line.
+  printf '%s\n' "$cmd" | fold -s -w $((w - 6)) | sed 's/^/    /'
+  [ "$#" -gt 0 ] && printf '  %s%s%s\n' "$_CC_C_DIM" "$*" "$_CC_C_OFF"
+  return 0
+}
+
 # ── The fzf preview ──────────────────────────────────────────────────────────
 # For a stored pane the state file is the truth; for a live one, the screen. A
 # container previews its children, because that is what its actions will touch.
 _cc_preview() {
-  local line node lev st key target inv state l sid role cls n
+  local line node lev st key target inv state l sid role cls n \
+        pcmd ptyped preplay psid kv lcmd ltyped lsid
   line="${1:-}"
   node="$(printf '%s' "$line" | cut -f2)"
   lev="$(printf '%s' "$line" | cut -f3)"
@@ -1076,7 +1150,16 @@ _cc_preview() {
       return 0 ;;
   esac
 
-  printf '  %s   %s  %s\n\n' "$st" "$target" "$node"
+  # Header. The node id is suppressed when it repeats the target, which is the
+  # case for every awake pane row (%0 %0) — a duplicated identifier reads as two
+  # facts and is one.
+  if [ "$node" = "$target" ]; then
+    printf '  %s%s%s  %s%s%s\n' "$_CC_C_BOLD" "$st" "$_CC_C_OFF" "$_CC_C_BOLD" "$target" "$_CC_C_OFF"
+  else
+    printf '  %s%s%s  %s%s%s  %s%s%s\n' "$_CC_C_BOLD" "$st" "$_CC_C_OFF" \
+      "$_CC_C_BOLD" "$target" "$_CC_C_OFF" "$_CC_C_DIM" "$node" "$_CC_C_OFF"
+  fi
+  printf '  %s%s%s\n\n' "$_CC_C_DIM" "$(_cc_rule "$(( ${FZF_PREVIEW_COLUMNS:-58} - 4 ))")" "$_CC_C_OFF"
 
   if [ "$key" != "-" ] && [ -n "$key" ]; then
     state="$(cc_store_path "$key")"
@@ -1105,9 +1188,33 @@ _cc_preview() {
         n=$((n + 1))
       done < "$state"
       [ "$n" = "0" ] && printf '    (none recorded)\n'
-      printf '\n  secondary sessions are recorded and listed but never\n'
-      printf '  auto-resumed by a thaw; resume one by hand with\n'
-      printf '  claude --resume <uuid>\n'
+
+      # The command a thaw of THIS entry will run. Composed from the record the
+      # freeze wrote — the typed capture if there was one, else the process the
+      # freeze saw — so it survives the pane's disappearance.
+      pcmd=''; ptyped=''; preplay=''; psid=''
+      while IFS= read -r l; do
+        case "$l" in
+          'pane	'*)
+            pcmd="$(_cc_unb64 "$(_cc_tag "$l" ';CMD=')" 2>/dev/null)"
+            ptyped="$(_cc_tag "$l" ';TYPED=')" || ptyped=''
+            ;;
+          'sid	'*)
+            [ -n "$psid" ] && continue
+            case "$l" in *';ROLE=primary'*|*';ROLE='*) ;; esac
+            psid="$(_cc_tag "$l" ';CLAUDE_SID=')" || psid=''
+            preplay="$(_cc_tag "$l" ';CLAUDISH_REPLAY=')" || preplay=''
+            ;;
+        esac
+      done < "$state"
+      if [ -n "$psid" ] || [ -n "$pcmd" ]; then
+        kv="$(_cc_restore_cmd_kv "$pcmd" "$ptyped" "$psid" "$preplay")"
+        _cc_restore_block "${kv%%	*}" "${kv#*	}" \
+          'runs on thaw (C-W), in the pane it was frozen from'
+      fi
+
+      printf '\n  %sSecondary sessions are listed but never auto-resumed by a\n' "$_CC_C_DIM"
+      printf '  thaw. Resume one by hand: claude --resume <uuid>%s\n' "$_CC_C_OFF"
       return 0
     fi
     printf '  The state file for key %s is missing or unreadable.\n' "$key"
@@ -1117,14 +1224,32 @@ _cc_preview() {
   fi
 
   # AWAKE: the live screen of THIS pane (FR4.5).
-  printf '  cwd  %s\n' "$($TMUX_CMD display-message -p -t "$node" '#{pane_current_path}' 2>/dev/null)"
+  printf '  %-14s %s\n' 'cwd' \
+    "$($TMUX_CMD display-message -p -t "$node" '#{pane_current_path}' 2>/dev/null)"
   if [ -s "$inv" ]; then
     awk -F'\t' -v n="$node" '$13 == n {
-      if ($16 != "-") printf "  claude session  %s…\n", $16
-      printf "  command         %s\n", $15
+      if ($16 != "-") printf "  %-14s %s…\n", "claude session", $16
+      printf "  %-14s %s\n", "command", $15
     }' "$inv"
   fi
-  printf '\n  ── last 50 lines of this pane ───────────────────────\n'
+
+  # The restore command for a pane that is still RUNNING. Shown deliberately:
+  # the useful moment to check what a freeze would put back is BEFORE freezing,
+  # not after, when the pane is gone and the answer can no longer be compared
+  # against reality. Inputs are the ones its own freeze would capture.
+  lcmd="$(_cc_live_full_cmd "$node" 2>/dev/null)" || lcmd=''
+  ltyped="$(_cc_live_typed_b64 "$node" 2>/dev/null)" || ltyped=''
+  lsid=''
+  case "$lcmd" in
+    *--resume\ *) lsid="${lcmd#*--resume }"; lsid="${lsid%% *}" ;;
+  esac
+  if [ -n "$ltyped" ] || [ -n "$lsid" ]; then
+    kv="$(_cc_restore_cmd_kv "$lcmd" "$ltyped" "$lsid" '')"
+    _cc_restore_block "${kv%%	*}" "${kv#*	}" \
+      'what a freeze of this pane would put back'
+  fi
+
+  printf '\n  %s── last 50 lines of this pane ───────────────────────%s\n' "$_CC_C_DIM" "$_CC_C_OFF"
   $TMUX_CMD capture-pane -p -S -50 -t "$node" 2>/dev/null | sed 's/^/  /'
 }
 
