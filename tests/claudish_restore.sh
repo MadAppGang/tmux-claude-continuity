@@ -32,7 +32,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")/../scripts" && pwd)"
 RESTORE="$SCRIPT_DIR/post_restore.sh"
 
 case "$SOCKET" in default|"") echo "unsafe socket"; exit 1 ;; esac
-_t() { tmux -L "$SOCKET" "$@"; }
+# -f /dev/null is mandatory. Without it this throwaway server sources
+# ~/.tmux.conf, which loads tmux-continuum and can restore the user's REAL
+# estate into it — ~76 panes plus duplicate `claude --resume` processes on live
+# session ids. Three servers created that way were found still running days
+# later on this machine, holding 319 of its 511 PTYs.
+_t() { tmux -L "$SOCKET" -f /dev/null "$@"; }
 
 cleanup() {
   for s in $(_t list-sessions -F '#{session_name}' 2>/dev/null); do _t kill-session -t "$s" 2>/dev/null; done

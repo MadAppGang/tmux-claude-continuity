@@ -38,7 +38,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")/../scripts" && pwd)"
 RESTORE_SCRIPT="$SCRIPT_DIR/post_restore.sh"
 
 pass=0; fail=0
-_t(){ tmux -L "$SOCKET" "$@"; }
+# An empty or "default" socket label would aim every command in this file at the
+# user's real server; refuse before defining the wrapper. -f /dev/null then stops
+# the throwaway server sourcing ~/.tmux.conf and restoring the real estate into
+# itself (see claudish_restore.sh).
+case "$SOCKET" in default|"") echo "unsafe socket [$SOCKET]"; exit 1 ;; esac
+_t(){ tmux -L "$SOCKET" -f /dev/null "$@"; }
 _teardown(){ _t kill-server 2>/dev/null; rm -rf "$QD" "$RD" "$LOG"; }
 # Re-wrap the teardown so a leak into the real resurrect dir fails the run
 # even on the early-abort paths that never reach the final assertions.
@@ -55,7 +60,7 @@ for p in $(_t list-panes -t work -F '#{pane_id}'); do _t select-pane -t "$p" -T 
 # The SAVE side. Without this, any save resurrect performs lands in the user's
 # live directory: helpers.sh defaults there whenever the option is unset.
 _t set-option -g @resurrect-dir "$RD"
-cc_guard_resurrect_dir "$RD" tmux -L "$SOCKET"
+cc_guard_resurrect_dir "$RD" tmux -L "$SOCKET" -f /dev/null
 _t set-option -g @claude-continuity-claude-cmd "echo"
 _t set-option -g @claude-continuity-pending-dir "$QD"
 _t set-option -g @claude-continuity-log-file "$LOG"

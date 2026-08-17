@@ -35,8 +35,69 @@
 
 set -u
 
-SNAPSHOT_FILE="${1:-}"
-[ -n "$SNAPSHOT_FILE" ] && [ -f "$SNAPSHOT_FILE" ] || exit 0
+# ── The snapshot integrity detector (Bug B) ──────────────────────────────────
+# One awk pass, and it is the ONLY implementation — `pre_save.sh --check <file>`
+# exposes exactly this function so a test can prove the detector fires on a
+# known-bad snapshot instead of merely never complaining (a check that cannot
+# fail proves nothing).
+#
+# What a healthy resurrect dump looks like, and why each rule is a rule:
+#   * pane rows are keyed by (session, window, pane_index) — unique by
+#     construction, one row per live pane. A repeat means two save.sh processes
+#     appended to the same one-second filename.
+#   * window rows are keyed by (session, window_index) — same argument.
+#   * `dump_state` writes EXACTLY ONE `state` row, last. Zero means the file was
+#     truncated by another save before this one finished; two means two saves'
+#     tails both landed.
+#   * `panes>0 && windows==0` is the measured truncation signature (`panes=36
+#     windows=0` on the live machine).
+#
+# A RECORD IS NOT A LINE, and this is why duplicate detection is KEYED and never
+# whole-line. save.sh:196 builds each pane row with
+# `full_command="$(pane_full_command $pane_pid)"` — a `ps` result, which can and
+# does contain newlines — so ONE pane record legitimately spans several physical
+# lines, and its continuation lines are short, generic and repeat across panes.
+# The user's live snapshot right now contains exactly that: two `-zsh<TAB>` lines
+# and two `<defunct><TAB>` lines, from two shells that each have a defunct child.
+# A whole-line "an identical line can never repeat" rule called that healthy
+# 72-pane snapshot DOUBLED, which would have vetoed EVERY save on this machine
+# and frozen `last` at an old snapshot for good. Only the keyed counters — pane
+# by (session, window, pane_index) and window by (session, window_index), both of
+# which are unique by construction and neither of which a continuation line can
+# reach, because a continuation line's $1 is not "pane"/"window" — are trusted.
+# They are also what the real defect produced: 146 pane rows for 73 live panes.
+# Prints one line: `OK …` | `DOUBLED …` | `TRUNCATED …` | `EMPTY …`.
+_cc_snapshot_verdict() {
+  [ -f "$1" ] || { printf 'EMPTY missing\n'; return 0; }
+  awk -F'\t' '
+    { rows++ }
+    $1 == "pane"   { p++; k = $2 SUBSEP $3 SUBSEP $6; if (pk[k]++) dp++ }
+    $1 == "window" { w++; k = $2 SUBSEP $3;           if (wk[k]++) dw++ }
+    $1 == "state"  { s++ }
+    END {
+      if (rows == 0) { print "EMPTY rows=0"; exit }
+      if (dp > 0 || dw > 0) {
+        printf "DOUBLED dup_pane=%d dup_window=%d panes=%d windows=%d\n",
+          dp + 0, dw + 0, p + 0, w + 0; exit }
+      if (p == 0)  { printf "TRUNCATED panes=0 rows=%d\n", rows; exit }
+      if (w == 0)  { printf "TRUNCATED panes=%d windows=0\n", p; exit }
+      if (s != 1)  { printf "TRUNCATED panes=%d windows=%d state_rows=%d\n", p, w, s + 0; exit }
+      printf "OK panes=%d windows=%d state=%d\n", p, w, s
+    }' "$1" 2>/dev/null
+}
+
+# `--check <file>`: print the verdict, exit 0 when OK and 1 otherwise. Handled
+# before anything else in this file so it forks nothing, reads no tmux option
+# and touches no store.
+if [ "${1:-}" = "--check" ]; then
+  _cc_v="$(_cc_snapshot_verdict "${2:-}")"
+  printf '%s\n' "$_cc_v"
+  case "$_cc_v" in OK*) exit 0 ;; *) exit 1 ;; esac
+fi
+
+# NB: the SNAPSHOT_FILE guard deliberately sits BELOW the logging block and the
+# `--verify-last` handler. It used to be here, which made every mode flag that
+# is not a readable file exit 0 before its handler was ever reached.
 
 # Every tmux call goes through $TMUX_CMD so this script is drivable against an
 # isolated test socket (`TMUX_CMD="tmux -L sock -f /dev/null"`, landmine L14).
@@ -64,6 +125,67 @@ _cc_log() {
   { mkdir -p "$(dirname "$_CC_SAVE_LOG")" 2>/dev/null && \
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$_CC_SAVE_LOG"; } 2>/dev/null || true
 }
+
+# ── `--verify-last [<dir>]`: the AFTER-PUBLICATION check ─────────────────────
+# NOT reachable from the post-save-layout hook, and deliberately so. See the
+# self-rm note further down: whether `last` ends up dangling is decided at
+# save.sh:247-251, AFTER this hook has returned, so no amount of work at :246
+# can guarantee the outcome. Measured, 8 concurrent saves x 3 trials against the
+# real save.sh: vanilla resurrect leaves `last` unrestorable 3/3; the :246
+# guards below cut that to 1/3; only a check that runs after :251 closes it.
+#
+# resurrect calls `execute_hook "post-save-all"` at save.sh:259 — after the
+# symlink has been moved — which is the correct place. Wiring it up is ONE line
+# in tmux-claude-continuity.tmux:
+#
+#   set-option -g @resurrect-hook-post-save-all "'<scripts>/pre_save.sh' --verify-last"
+#
+# That file was outside the scope of this change, so the mechanism is provided
+# and tested here but is NOT yet registered: until that line is added this entry
+# point is inert and the residual 1-in-3 remains.
+#
+# It is idempotent, forks at most two processes on the healthy path, and repairs
+# by copying rather than by re-linking — a regular-file `last` cannot be made to
+# dangle by a later `rm`, and restore.sh reads it as a plain path either way.
+if [ "${1:-}" = "--verify-last" ]; then
+  _cc_vl_dir="${2:-}"
+  if [ -z "$_cc_vl_dir" ]; then
+    _cc_vl_dir="$($TMUX_CMD show-option -gqv @resurrect-dir 2>/dev/null)"
+    _cc_vl_dir="${_cc_vl_dir:-$HOME/.local/share/tmux/resurrect}"
+  fi
+  # tmux options may carry a leading ~ that the shell never expanded.
+  case "$_cc_vl_dir" in "~/"*) _cc_vl_dir="$HOME/${_cc_vl_dir#\~/}" ;; esac
+  _cc_vl_last="$_cc_vl_dir/last"
+  _cc_vl_v="$(_cc_snapshot_verdict "$_cc_vl_last")"
+  case "$_cc_vl_v" in
+    OK*) exit 0 ;;
+  esac
+  # `last` cannot restore. Find the newest snapshot that can.
+  _cc_vl_good=""
+  for _cc_vl_f in $(ls -t "$_cc_vl_dir"/tmux_resurrect_*.txt 2>/dev/null); do
+    [ -f "$_cc_vl_f" ] || continue
+    case "$(_cc_snapshot_verdict "$_cc_vl_f")" in
+      OK*) _cc_vl_good="$_cc_vl_f"; break ;;
+    esac
+  done
+  if [ -z "$_cc_vl_good" ]; then
+    _cc_log "LAST-UNREPAIRABLE 'last' is $_cc_vl_v and no complete snapshot exists in $_cc_vl_dir to repair it from"
+    exit 1
+  fi
+  _cc_vl_tmp="$_cc_vl_last.cc.$$"
+  if cat "$_cc_vl_good" > "$_cc_vl_tmp" 2>/dev/null && [ -s "$_cc_vl_tmp" ] && \
+     mv -f "$_cc_vl_tmp" "$_cc_vl_last" 2>/dev/null; then
+    _cc_log "LAST-REPAIRED 'last' was $_cc_vl_v after publication — replaced with a regular-file copy of $(basename "$_cc_vl_good")"
+    exit 0
+  fi
+  rm -f "$_cc_vl_tmp" 2>/dev/null
+  _cc_log "LAST-REPAIR-FAILED 'last' is $_cc_vl_v and could not be replaced from $(basename "$_cc_vl_good")"
+  exit 1
+fi
+
+# The hook proper: resurrect hands us the snapshot it has just written.
+SNAPSHOT_FILE="${1:-}"
+[ -n "$SNAPSHOT_FILE" ] && [ -f "$SNAPSHOT_FILE" ] || exit 0
 
 # ── Shared libraries ─────────────────────────────────────────────────────────
 # The pane→session climb, its ;DUP= branch, the claudish replay reconstruction
@@ -203,7 +325,302 @@ clobber_guard() {
     cat "$last_guard" > "$SNAPSHOT_FILE" 2>/dev/null || true
   fi
 }
-trap clobber_guard EXIT
+# ── Snapshot repair and the publication veto (Bug B) ─────────────────────────
+# This hook runs at save.sh:246 — after all four dumps, but BEFORE
+# `files_differ`/`ln -fs … last` at 247-248. That is the last instant at which a
+# save can still be made a no-op, and it is the only lever a post-save hook has.
+#
+# NEUTRALISE is the existing, proven mechanism (the clobber guard has used it
+# since it was written): overwrite the new file with the current `last`, so
+# save.sh sees them as identical, `rm`s the new file, and leaves `last` pointing
+# at the good snapshot. Nothing is deleted and no symlink is moved by us.
+_CC_SNAP_DIR="$(dirname "$SNAPSHOT_FILE")"
+_CC_LAST_FILE="$_CC_SNAP_DIR/last"
+
+_cc_can_neutralise() {
+  # Never against ourselves: several tests (and a hand-run save) point the hook
+  # straight at `last`, and `cat last > last` would truncate the only good
+  # snapshot on the machine.
+  [ "$SNAPSHOT_FILE" = "$_CC_LAST_FILE" ] && return 1
+  case "$(readlink "$_CC_LAST_FILE" 2>/dev/null)" in
+    "$(basename "$SNAPSHOT_FILE")") return 1 ;;
+  esac
+  [ -e "$_CC_LAST_FILE" ] || return 1
+  # And never onto a fallback that is not itself complete: replacing a damaged
+  # snapshot with a damaged one buys nothing and could lose a good save.
+  case "$(_cc_snapshot_verdict "$_CC_LAST_FILE")" in OK*) return 0 ;; *) return 1 ;; esac
+}
+
+_cc_neutralise() { cat "$_CC_LAST_FILE" > "$SNAPSHOT_FILE" 2>/dev/null || true; }
+
+# ── The self-rm trap: how `last` came to point at nothing ────────────────────
+# MEASURED, against the real save.sh (see save_all above, lines 246-251):
+#
+#     cmp -s "$resurrect_file_path" "$last_resurrect_file"
+#
+# `last` is a SYMLINK. When an earlier save of the SAME SECOND has already
+# published — `ln -fs tmux_resurrect_<T>.txt last` — a later save whose
+# `resurrect_file_path` is that very same `tmux_resurrect_<T>.txt` compares the
+# file against a symlink to ITSELF. cmp of a file with itself is always
+# identical, whatever either of them contains, so `files_differ` is always false
+# and save.sh always takes the else branch:
+#
+#     rm "$resurrect_file_path"      ← deletes the snapshot `last` points at
+#
+# and `last` is left DANGLING. Restore then reads a path that does not exist,
+# sees zero windows, and "succeeds" having restored nothing. That is the step
+# that turned a crash into "everything is gone", and it is vanilla resurrect
+# behaviour: no plugin, no freeze store and no lock is required to reach it,
+# only two saves sharing one one-second filename. Verified in isolation:
+#   ln -fs F last; cmp -s F last -> rc 0 -> rm F -> last dangles.
+#
+# THE FIX, and why it can live in THIS hook. We run at :246, one line before the
+# cmp, so we can change what the cmp sees. Content cannot help — a file always
+# equals itself — so we break the IDENTITY instead: `last` is replaced by a
+# REGULAR FILE holding the snapshot's bytes. The cmp then compares two distinct
+# inodes with equal content, still takes the `rm` branch, and the `rm` is now
+# harmless: it removes the redundant .txt while `last` keeps a complete,
+# restorable copy. restore.sh only ever reads `$(last_resurrect_file)` as a
+# path, so a regular file serves it exactly as a symlink does, and the next
+# ordinary save's `ln -fs` restores the symlink form by itself.
+_cc_last_target_is_me() {
+  local t base
+  [ -e "$_CC_LAST_FILE" ] || return 1
+  [ "$SNAPSHOT_FILE" = "$_CC_LAST_FILE" ] && return 0
+  t="$(readlink "$_CC_LAST_FILE" 2>/dev/null)"
+  [ -n "$t" ] || return 1
+  base="${SNAPSHOT_FILE##*/}"
+  case "$t" in
+    "$base")            return 0 ;;
+    "$SNAPSHOT_FILE")   return 0 ;;
+    "$_CC_SNAP_DIR/$base") return 0 ;;
+  esac
+  return 1
+}
+
+# Replace `last` with a regular-file copy of <src>, atomically (write beside it,
+# then rename over it). rename(2) replaces the SYMLINK, never its target, so the
+# snapshot being copied from is not disturbed.
+_cc_materialise_last() {
+  local src="$1" tmp
+  [ -f "$src" ] || return 1
+  [ -s "$src" ] || return 1
+  tmp="${_CC_LAST_FILE}.cc.$$"
+  cat "$src" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  [ -s "$tmp" ] || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$_CC_LAST_FILE" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# The newest snapshot in the directory, other than this one, that would actually
+# restore. Only ever consulted on a failure path, and capped, so its cost never
+# lands on a healthy save.
+_cc_newest_good_snapshot() {
+  local f n=0
+  for f in $(ls -t "$_CC_SNAP_DIR"/tmux_resurrect_*.txt 2>/dev/null); do
+    [ -f "$f" ] || continue
+    [ "$f" = "$SNAPSHOT_FILE" ] && continue
+    n=$((n + 1)); [ "$n" -gt 12 ] && break
+    case "$(_cc_snapshot_verdict "$f")" in OK*) printf '%s' "$f"; return 0 ;; esac
+  done
+  return 1
+}
+
+# `last` must never be left resolving to something that cannot restore. Called
+# on every exit path of every save, winner or loser. Touches ONLY `last` — never
+# the snapshot file — so it is safe to run against a file another save owns.
+_cc_guard_last() {
+  local v good
+  _cc_last_target_is_me || return 1          # 1 = "not the self-rm case"
+  v="$(_cc_snapshot_verdict "$SNAPSHOT_FILE")"
+  case "$v" in
+    OK*)
+      if _cc_materialise_last "$SNAPSHOT_FILE"; then
+        _cc_log "LAST-DETACH 'last' already resolved to $(basename "$SNAPSHOT_FILE") ($v); save.sh is about to rm that file because cmp finds it identical to itself — 'last' replaced with a regular-file copy so it cannot be left dangling"
+      else
+        _cc_log "LAST-AT-RISK could not copy $(basename "$SNAPSHOT_FILE") over 'last'; save.sh's rm may leave 'last' dangling"
+      fi
+      return 0 ;;
+  esac
+  good="$(_cc_newest_good_snapshot)" || good=""
+  if [ -n "$good" ] && _cc_materialise_last "$good"; then
+    _cc_log "LAST-RESCUE 'last' resolved to $(basename "$SNAPSHOT_FILE") which is $v and is about to be rm'd — 'last' repointed at the newest complete snapshot $(basename "$good")"
+  else
+    _cc_log "LAST-AT-RISK 'last' resolves to $(basename "$SNAPSHOT_FILE") which is $v and no complete snapshot exists to fall back to"
+  fi
+  return 0
+}
+
+# Collapse rows that a concurrent save appended twice. RESTRICTED TO RECORD
+# HEADERS — a line whose first TAB field is one of the four types resurrect
+# emits — because those are the only lines that are unique by construction.
+#
+# It used to be a bare `awk '!seen[$0]++'` over every line, which is data loss:
+# a pane record can span several lines (save.sh:196 interpolates a `ps` result
+# that may contain newlines), and its continuation lines are generic enough to
+# repeat legitimately. Measured on the user's real snapshot — that whole-line
+# form deleted two genuine lines (`-zsh`, `<defunct>`) from a healthy 72-pane
+# dump, silently truncating two panes' recorded commands. Continuation lines are
+# now never candidates for removal; leaving a stray one behind is harmless
+# (restore.sh skips any line whose type it does not recognise), whereas deleting
+# one corrupts the record above it.
+_cc_snapshot_dedup() {
+  local out removed
+  out="${SNAPSHOT_FILE}.dedup.$$"
+  awk -F'\t' '
+    $1=="pane" || $1=="window" || $1=="state" || $1=="grouped_session" {
+      if (seen[$0]++) next
+    }
+    { print }' "$SNAPSHOT_FILE" > "$out" 2>/dev/null || { rm -f "$out"; return 0; }
+  [ -s "$out" ] || { rm -f "$out"; return 0; }
+  removed=$(( $(wc -l < "$SNAPSHOT_FILE") - $(wc -l < "$out") ))
+  if [ "$removed" -gt 0 ]; then
+    mv "$out" "$SNAPSHOT_FILE" 2>/dev/null || { rm -f "$out"; return 0; }
+    _cc_log "SNAPSHOT-REPAIR removed $removed duplicated row(s) from $(basename "$SNAPSHOT_FILE") — a concurrent save interleaved with this one"
+  else
+    rm -f "$out"
+  fi
+  return 0
+}
+
+# ── GUARD 2: `last` is only ever repointed at a snapshot that can restore ────
+# Runs on EVERY exit path, ahead of the clobber guard, so the early `exit 0`s
+# below (no by-pid dir, no live panes) are covered too.
+#
+# WHERE THIS IS ENFORCED, AND WHY HERE. This hook is `post-save-layout`, which
+# resurrect calls at save.sh:246 — after all four dumps, and immediately BEFORE
+# the `files_differ`/`ln -fs … last` at :247-251. It is therefore the last
+# instant at which a save can still be turned into a no-op, and it is the only
+# lever any post-save hook has. Two levers exist at that instant, and this guard
+# uses both:
+#
+#   * CONTENT — make the new file byte-identical to `last`, so `files_differ` is
+#     false, save.sh `rm`s it, and `last` is never repointed. This is the veto,
+#     and it is what stops a doubled/truncated/empty snapshot being published.
+#   * IDENTITY — replace the `last` SYMLINK with a regular file, so save.sh's
+#     `rm` of the .txt cannot leave `last` dangling. This is _cc_guard_last.
+#
+# What CANNOT be done from here: stopping a second save.sh from starting, or
+# from truncating a filename this one is already writing. resurrect has no
+# pre-save hook, so preventing the concurrent DUMP has to happen upstream in
+# whatever invokes save.sh — it is not enforceable from this hook, and this
+# guard does not pretend to. It makes the RESULT safe, not the race absent.
+save_integrity_guard() {
+  local v
+  # Identity first: it touches only `last`, and it is the branch that fires when
+  # this snapshot is simultaneously the published one and the doomed one.
+  if _cc_guard_last; then
+    return 0
+  fi
+  _cc_snapshot_dedup
+  v="$(_cc_snapshot_verdict "$SNAPSHOT_FILE")"
+  case "$v" in
+    OK*) return 0 ;;
+  esac
+  # A damaged snapshot, and `last` is some other file. Prefer vetoing onto the
+  # current `last`; if that is itself damaged or missing, rescue `last` from the
+  # newest complete snapshot first so there IS something good to veto onto.
+  if ! _cc_can_neutralise; then
+    local good
+    good="$(_cc_newest_good_snapshot)" || good=""
+    if [ -n "$good" ] && _cc_materialise_last "$good"; then
+      _cc_log "LAST-RESCUE 'last' was missing or unusable while this save is $v — repointed at the newest complete snapshot $(basename "$good")"
+    fi
+  fi
+  if _cc_can_neutralise; then
+    _cc_log "SNAPSHOT-VETO $(basename "$SNAPSHOT_FILE") is $v — refusing to publish it; keeping the current 'last'"
+    _cc_neutralise
+  else
+    _cc_log "SNAPSHOT-DAMAGED $(basename "$SNAPSHOT_FILE") is $v and there is no complete snapshot to fall back to — publishing it anyway"
+  fi
+  return 0
+}
+
+_cc_save_exit() { save_integrity_guard; clobber_guard; _cc_save_lock_release; }
+
+# ── The save mutex, hook side (Bug B) ────────────────────────────────────────
+# The dump-preventing gate is in cc_freeze.sh (`cc_freeze.sh save`), because
+# resurrect has no pre-save hook and a post-save hook cannot stop a dump that
+# has already happened. This is the second line, and it covers the callers the
+# plugin does not own — tmux-continuum's 5-second check and the manual binding.
+# It protects the PUBLICATION step: exactly one of N overlapping saves gets to
+# repoint `last`, and the losers cost one `cat` and exit 0 quietly.
+#
+# The lock lives in the resurrect directory, not in the freeze store: the
+# resource being serialised is this snapshot directory and its `last`, and
+# siting it there also means a machine that has never frozen a window does not
+# get a freeze store materialised by a save hook.
+# The snapshot path the current lock holder is building, or empty when it cannot
+# be established. The holder records it immediately after taking the lock, so a
+# loser can arrive inside that gap and read nothing; the short bounded retry
+# closes that window. This is NOT waiting on the lock — it never waits for the
+# lock to be released, only for the holder to finish naming its file, and it
+# gives up after 200 ms regardless. An empty answer is treated by the caller as
+# "assume we share the file", which is the direction that cannot corrupt.
+_cc_inflight_snapshot() {
+  local f="$_CC_SNAP_DIR/.cc-save-lock/save/snapshot" i=0 s=""
+  while [ "$i" -lt 20 ]; do
+    if [ -f "$f" ]; then
+      IFS= read -r s < "$f" 2>/dev/null
+      [ -n "$s" ] && { printf '%s' "$s"; return 0; }
+    fi
+    # The holder finished and dropped the lock: nothing is in flight any more.
+    [ -d "$_CC_SNAP_DIR/.cc-save-lock/save" ] || return 1
+    sleep 0.01
+    i=$((i + 1))
+  done
+  return 1
+}
+
+_CC_SAVE_LOCK=""
+_cc_save_lock_release() {
+  [ -n "$_CC_SAVE_LOCK" ] || return 0
+  type _cc_lock_release >/dev/null 2>&1 && _cc_lock_release "$_CC_SAVE_LOCK"
+  _CC_SAVE_LOCK=""
+}
+
+# Installed BEFORE the lock is taken, on purpose: _cc_lock_take installs its own
+# EXIT handler only when the caller has none, and this file's handler must be
+# the one that survives — it releases the lock AND runs the two guards.
+trap _cc_save_exit EXIT
+
+if type _cc_lock_acquire >/dev/null 2>&1; then
+  if [ -n "${CC_SAVE_LOCK_HELD:-}" ]; then
+    # Our own `cc_freeze.sh save` is the save.sh that spawned us, and it already
+    # holds the mutex for the whole dump. Contending with our own grandparent
+    # would make every serialised save neutralise its own snapshot.
+    :
+  elif _cc_lock_acquire "$_CC_SNAP_DIR/.cc-save-lock" save; then
+    _CC_SAVE_LOCK="$_CC_LOCK_LAST"
+    printf '%s\n' "$SNAPSHOT_FILE" > "$_CC_SAVE_LOCK/snapshot" 2>/dev/null || true
+  else
+    # BUSY: another save is in flight and its owner is CONFIRMED LIVE. Not an
+    # error — the in-flight save covers this one.
+    #
+    # A loser must still leave the directory safe. It used to `exit 0` with the
+    # EXIT trap disarmed, which skipped GUARD 2 entirely — and its own save.sh
+    # then walked into the self-rm at :251 and dangled `last`. It also
+    # neutralised unconditionally, which overwrites a file the WINNER may be
+    # enriching at that moment. Both are fixed below.
+    _cc_busy_snap="$(_cc_inflight_snapshot)" || _cc_busy_snap=""
+    if [ -z "$_cc_busy_snap" ] || [ "$_cc_busy_snap" = "$SNAPSHOT_FILE" ]; then
+      # Same second ⇒ same filename ⇒ the holder owns and is repairing the very
+      # file we were handed; not one byte of it is ours to write. An UNKNOWN
+      # holder is treated the same way, which is the safe direction. `last` is
+      # still ours to protect: _cc_guard_last touches nothing but `last`.
+      _cc_log "SAVE-BUSY: the in-flight save owns $(basename "$SNAPSHOT_FILE") — leaving its contents alone"
+      _cc_guard_last || true
+    else
+      # A different file: ours alone, so the full guard applies to it.
+      _cc_log "SAVE-BUSY: another save is in flight on a different file; skipping enrichment and running the integrity guard on ours"
+      save_integrity_guard
+      clobber_guard
+    fi
+    trap - EXIT
+    _cc_save_lock_release
+    exit 0
+  fi
+fi
 
 # ── Freeze-store heartbeat ───────────────────────────────────────────────────
 # Everything in this block is ABOVE the two early exits further down ("no by-pid
@@ -304,10 +721,46 @@ _cc_kick_sweep() {
   $TMUX_CMD run-shell -b "'$script' sweep >/dev/null 2>&1 || true" 2>/dev/null || true
 }
 
+# ── GUARD 1: the heartbeat may never block the save ──────────────────────────
+# The three calls below MUTATE the freeze store: `cc_ledger_tick` rewrites the
+# ledger, `_cc_confirm_thaws` archives entries. Under the save pile-up that took
+# this machine down there were 18 save.sh alive at once, so 18 of these ran
+# concurrently over one ledger file. They need a mutex.
+#
+# But a mutex on the save path is exactly how a slow freeze becomes a lost
+# snapshot, so it is taken NON-BLOCKING and its failure is a SKIP, never a wait:
+# `_cc_lock_acquire` returns 1 immediately when the lock is held by a confirmed-
+# live owner (it has never had a retry loop — see cc_common.sh). A held lock
+# costs this save its heartbeat and nothing else.
+#
+# THE ORDER OF HARM. Losing one 15-minute ledger tick is invisible: the next
+# save does it, and the ledger's authoritative-source rule means a skipped tick
+# carries values forward rather than inventing them. Losing the SNAPSHOT means
+# the user's 17 sessions do not come back. So the store work is subordinate to
+# the save, always, and the lock is the only thing that may be given up.
+#
+# The lock NAME is `heartbeat`, deliberately not `sweep`: this block kicks the
+# sweep, and holding the sweep's own lock while asking for a sweep would make
+# autofreeze a permanent no-op.
 if [ -n "$_CC_STORE_NS" ] && type cc_ledger_tick >/dev/null 2>&1; then
-  cc_ledger_tick
-  _cc_confirm_thaws "$_CC_STORE_NS"
-  _cc_kick_sweep
+  _cc_store_lock=""
+  _cc_store_busy=0
+  if type _cc_lock_acquire >/dev/null 2>&1; then
+    if _cc_lock_acquire "$(cc_store_lock_root)" heartbeat; then
+      _cc_store_lock="$_CC_LOCK_LAST"
+    else
+      _cc_store_busy=1
+    fi
+  fi
+  if [ "$_cc_store_busy" = "1" ]; then
+    _cc_log "STORE-BUSY: the freeze store 'heartbeat' lock is held by a live worker — SKIPPING this save's store block (ledger tick, thaw confirmation, sweep kick). The snapshot itself is unaffected and this save completes normally."
+  else
+    cc_ledger_tick
+    _cc_confirm_thaws "$_CC_STORE_NS"
+    _cc_kick_sweep
+    [ -n "$_cc_store_lock" ] && _cc_lock_release "$_cc_store_lock"
+    _cc_store_lock=""
+  fi
 fi
 
 # ── Repair collapsed pane lines (empty pane_title) ───────────────────────────
@@ -342,6 +795,11 @@ if awk -F'\t' 'BEGIN { OFS = "\t" }
 else
   rm -f "$realigned"
 fi
+
+# Repair an interleaved dump before anything reads the rows. Also runs from the
+# exit chain, so the early exits below are covered; doing it here as well means
+# the enrichment pass never walks a doubled file.
+_cc_snapshot_dedup
 
 panes_dir="$($TMUX_CMD show-option -gqv @claude-continuity-panes-dir 2>/dev/null)"
 panes_dir="${panes_dir:-$HOME/.config/tmux-claude/panes}"
@@ -401,8 +859,9 @@ declare_map_file="${SNAPSHOT_FILE}.sidmap.$$"
 panes_file="${SNAPSHOT_FILE}.panes.$$"
 ps_file="${SNAPSHOT_FILE}.ps.$$"
 registry_file="${SNAPSHOT_FILE}.registry.$$"
-# Keep the clobber_guard on EXIT and add temp-file cleanup ahead of it.
-trap 'rm -f "$declare_map_file" "$panes_file" "$ps_file" "$registry_file" "${SNAPSHOT_FILE}.enrich.$$" "${SNAPSHOT_FILE}.strip.$$" "${SNAPSHOT_FILE}.thawps.$$"; clobber_guard' EXIT
+# Keep the exit chain (integrity guard → clobber guard → lock release) and add
+# temp-file cleanup ahead of it.
+trap 'rm -f "$declare_map_file" "$panes_file" "$ps_file" "$registry_file" "${SNAPSHOT_FILE}.enrich.$$" "${SNAPSHOT_FILE}.strip.$$" "${SNAPSHOT_FILE}.dedup.$$" "${SNAPSHOT_FILE}.thawps.$$"; _cc_save_exit' EXIT
 
 launch_dir="$($TMUX_CMD show-option -gqv @claude-continuity-launch-dir 2>/dev/null)"
 launch_dir="${launch_dir:-$HOME/.config/tmux-claude/launch}"
@@ -538,8 +997,8 @@ done < "$SNAPSHOT_FILE" > "$tmp"
 
 mv "$tmp" "$SNAPSHOT_FILE"
 rm -f "$declare_map_file"
-# Drop the temp-cleanup+guard trap (temps already cleaned) and run the guard
+# Drop the temp-cleanup trap (temps already cleaned) and run the exit chain
 # once, explicitly, against the now-enriched snapshot.
 trap - EXIT
 rm -f "$panes_file" "$ps_file" "$registry_file"
-clobber_guard
+_cc_save_exit

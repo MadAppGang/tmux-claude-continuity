@@ -226,6 +226,9 @@ done
 
 base_cmd="$claude_cmd"
 _cc_written=0
+_cc_considered=0        # rows that PASSED the Claude/restore-proc filter — the only
+                        # population the numerator and the skip counters are drawn
+                        # from, and therefore the only valid denominator
 _cc_proc_written=0     # non-Claude programs (@claude-continuity-restore-procs) relaunched
 _cc_skipped_absent=0    # SID rows whose session no longer exists live (benign)
 _cc_skipped_present=0   # SID rows whose session IS live but didn't resolve (real miss)
@@ -571,6 +574,18 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
     continue
   fi
 
+  # Everything past this filter is a row this boot PROMISED to resume, and it is
+  # the only honest denominator for the verdict below. It is counted by the loop
+  # that does the work rather than re-derived afterwards by an awk over a
+  # different predicate: the old denominator counted rows carrying CLAUDE_SID,
+  # while the numerator and the skip counters were drawn from THIS population,
+  # which also admits legacy un-enriched rows and configured restore_procs. The
+  # two populations differ, so the arithmetic produced impossible figures on the
+  # live machine — "queued 31/26", and once "queued 0/-5" where a negative
+  # denominator made 0 >= -5 true and printed PASS for a boot that resumed
+  # nothing at all.
+  _cc_considered=$((_cc_considered + 1))
+
   # Resolve the live tmux pane id (%N) for this snapshot row. The precmd hook
   # keys off $TMUX_PANE, so we write the pending file under the pane id, not the
   # session:window.pane string.
@@ -885,10 +900,27 @@ _cc_frozen_clause=""
 # as a REAL MISS, which is the detector an orphan must not be able to evade.
 _cc_total="$(awk -F'\t' '$1 == "pane" && /CLAUDE_SID/ { n++ } END { print n + 0 }' "$RESURRECT_FILE" 2>/dev/null)"
 case "${_cc_total:-}" in ''|*[!0-9]*) _cc_total=0 ;; esac
-_cc_resumable=$((_cc_total - _cc_skipped_absent - _cc_skipped_busy))
 
-if [ "$_cc_written" -ge "$_cc_resumable" ] && [ "$_cc_skipped_present" -eq 0 ] && [ "$_cc_total" -gt 0 ]; then
-  _cc_log "BOOT VERDICT: PASS — queued $_cc_written/$_cc_resumable resumable session(s) (${_cc_skipped_absent} absent from live layout, ${_cc_skipped_busy} already running, $_cc_total total)${_cc_frozen_clause}"
+# The denominator comes from the population the loop actually walked, not from a
+# separate awk over a different predicate. `_cc_total` (rows carrying a sid) is
+# still reported, because it is the useful "how enriched was this snapshot"
+# number — but it takes no part in the arithmetic.
+_cc_resumable=$((_cc_considered - _cc_skipped_absent - _cc_skipped_busy))
+[ "$_cc_resumable" -lt 0 ] && _cc_resumable=0
+
+# A boot with nothing to resume is NOT a pass. Reported separately so it can
+# never be mistaken for success: the old gate accepted `0 >= -5` and printed
+# PASS for a run against a server that had already died, which is precisely the
+# reassurance this verdict exists to withhold. Any gate whose passing condition
+# is satisfiable by two zeros — or by a negative — certifies nothing.
+if [ "$_cc_considered" -eq 0 ]; then
+  _cc_log "BOOT VERDICT: NOTHING TO RESUME — no snapshot row qualified as a Claude pane ($_cc_total row(s) carried a sid, $_cc_skipped_absent absent, $_cc_skipped_busy busy)${_cc_frozen_clause}"
+  $TMUX_CMD set-option -gu @claude-continuity-boot-warning 2>/dev/null
+elif [ "$_cc_resumable" -eq 0 ] && [ "$_cc_skipped_present" -eq 0 ]; then
+  _cc_log "BOOT VERDICT: NOTHING TO RESUME — all $_cc_considered candidate row(s) were accounted for without arming any ($_cc_skipped_absent absent from live layout, $_cc_skipped_busy already running)${_cc_frozen_clause}"
+  $TMUX_CMD set-option -gu @claude-continuity-boot-warning 2>/dev/null
+elif [ "$_cc_written" -ge "$_cc_resumable" ] && [ "$_cc_skipped_present" -eq 0 ]; then
+  _cc_log "BOOT VERDICT: PASS — queued $_cc_written/$_cc_resumable resumable session(s) (${_cc_skipped_absent} absent from live layout, ${_cc_skipped_busy} already running, $_cc_considered candidate row(s), $_cc_total carried a sid)${_cc_frozen_clause}"
   if [ "$_cc_frozen_warn" -gt 0 ]; then
     # Every resume this boot promised was queued, so the verdict is honestly
     # PASS — but a frozen window that could not be re-claimed is still something
@@ -900,7 +932,7 @@ if [ "$_cc_written" -ge "$_cc_resumable" ] && [ "$_cc_skipped_present" -eq 0 ] &
     $TMUX_CMD set-option -gu @claude-continuity-boot-warning 2>/dev/null
   fi
 else
-  _cc_log "BOOT VERDICT: INCOMPLETE — queued $_cc_written/$_cc_resumable resumable ($_cc_skipped_present REAL miss, $_cc_skipped_absent absent, $_cc_skipped_busy busy, $_cc_total total)${_cc_frozen_clause}"
+  _cc_log "BOOT VERDICT: INCOMPLETE — queued $_cc_written/$_cc_resumable resumable ($_cc_skipped_present REAL miss, $_cc_skipped_absent absent, $_cc_skipped_busy busy, $_cc_considered candidate row(s), $_cc_total carried a sid)${_cc_frozen_clause}"
   $TMUX_CMD set-option -g @claude-continuity-boot-warning \
     "⚠ claude-continuity: $_cc_written/$_cc_resumable resumed, $_cc_skipped_present lost — see $LOG_FILE" 2>/dev/null
   { printf '[%s] INCOMPLETE written=%s resumable=%s realmiss=%s absent=%s total=%s frozen=%s snapshot=%s\n' \

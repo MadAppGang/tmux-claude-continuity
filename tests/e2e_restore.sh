@@ -51,7 +51,9 @@ fail=0
 
 case "$SOCKET" in default|"") echo "unsafe socket label"; exit 1 ;; esac
 
-_t() { tmux -L "$SOCKET" "$@"; }
+# -f /dev/null is mandatory — see claudish_restore.sh for what sourcing the real
+# config into a test server did to this machine.
+_t() { tmux -L "$SOCKET" -f /dev/null "$@"; }
 
 _cleanup_test_socket() {
   for s in $(_t list-sessions -F '#{session_name}' 2>/dev/null); do

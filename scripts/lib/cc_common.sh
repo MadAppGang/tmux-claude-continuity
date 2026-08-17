@@ -19,10 +19,24 @@ _CC_COMMON_LOADED=1
 
 TMUX_CMD="${TMUX_CMD:-tmux}"
 
-# A lock whose owner file is older than this, or whose owner pid is dead, is
-# reclaimed once. A SIGKILLed worker wedges freeze/thaw for one attempt, never
-# forever (§2.4, ext-M3).
-CC_LOCK_STALE_SECS=300
+# ── Lock tuning (see the Locks section for what each one governs) ────────────
+# All three are overridable from the environment so a test can compress the
+# windows without editing the library. Defaults are the production values.
+#
+# STALE: an owner we cannot positively identify (a legacy 3-field owner file, or
+#   a `ps` that would not answer) is reclaimed once past this age. It is NEVER
+#   applied to an owner whose identity we CAN confirm — that is the naive
+#   age-based timeout that steals a live worker's lock.
+CC_LOCK_STALE_SECS="${CC_LOCK_STALE_SECS:-300}"
+# ORPHAN GRACE: the mkdir→owner-write window. A lock directory with NO owner
+#   file is either (a) a taker that is between mkdir(2) and its printf right
+#   now, or (b) a taker that died in that window and will never come back.
+#   (a) lasts microseconds — the owner write is fork-free by construction — so
+#   anything ownerless for longer than this grace is (b) and is reclaimed.
+CC_LOCK_ORPHAN_GRACE_SECS="${CC_LOCK_ORPHAN_GRACE_SECS:-5}"
+# CEILING: the backstop. Nothing this feature does — freeze, thaw, sweep, save —
+#   runs for a day, so a lock this old is a wedge whatever its owner file says.
+CC_LOCK_MAX_AGE_SECS="${CC_LOCK_MAX_AGE_SECS:-86400}"
 
 # ── Options ──────────────────────────────────────────────────────────────────
 # Same two lines every script in this repo inlines (post_restore.sh:51-52),
@@ -180,49 +194,260 @@ _cc_atomic_move() {
 }
 
 # ── Locks (§2.4) ─────────────────────────────────────────────────────────────
-# mkdir mutex plus an owner file: <pid> <server_pid> <epoch>.
-_cc_lock_owner_write() {
-  printf '%s\t%s\t%s\n' "$$" "$(_cc_server_pid)" "$(_cc_now)" > "$1/owner" 2>/dev/null
+# mkdir(2) mutex plus an owner file. FOUR TAB-separated fields, none ever empty:
+#
+#     <owner-pid> <TAB> <tmux-server-pid> <TAB> <epoch> <TAB> <start-token>
+#
+# THE LOCK ROOT IS NOT A LOCK. `cc_store_lock_root` is `<ns>/.lock`, and
+# `cc_store_ns_dir` creates it with `mkdir -p` on EVERY store access — so that
+# directory exists permanently, holds no owner file, and is created by a path
+# that never goes through `_cc_lock_take`. It is the CONTAINER; the locks are
+# its children. This was mistaken for a wedged, ownerless lock on the live
+# machine (found "held and empty", twice, and rmdir'd by hand). Two consequences
+# are encoded below: `_cc_lock_acquire` refuses a lock NAME that could resolve
+# back to the root, and no reclaim may ever `rm -rf` the root itself — doing so
+# would delete every live sibling lock in one call.
+#
+# ── HOW A DEAD OWNER IS TOLD FROM A LIVE ONE ─────────────────────────────────
+# Not by age. An age-based timeout steals the lock from a worker that is simply
+# slow, which is worse than the wedge it fixes. Identity is established in three
+# escalating steps, and only a failure of one of them permits a reclaim:
+#
+#   1. kill -0 <owner-pid>          — is anything at all running under that pid?
+#   2. start-token match            — is it the SAME process, or has the pid been
+#                                     recycled? `ps -o lstart=` of the owner pid
+#                                     is compared byte-for-byte with the token
+#                                     recorded when the lock was taken. This is
+#                                     what makes step 1 trustworthy: pids wrap,
+#                                     and after a reboot a dead worker's pid is
+#                                     very likely alive again as something else.
+#   3. tmux server-pid match        — a lock stamped by a different tmux server
+#                                     than the one we are talking to cannot be
+#                                     protecting anything in this server's world.
+#
+# An owner that passes all three is CONFIRMED LIVE and is never stolen from, at
+# any age below the CEILING. Everything else — missing owner file, non-numeric
+# pid, dead pid, recycled pid, foreign server, unparseable epoch, an owner form
+# we cannot confirm that is older than STALE, or any lock past the CEILING — is
+# reclaimable.
+#
+# ── THE mkdir→owner-write WINDOW ─────────────────────────────────────────────
+# mkdir(2) is the mutex; the owner file is written immediately after. A worker
+# killed in between leaves a lock directory with no owner file. That window is
+# closed from both ends:
+#
+#   * It is made vanishingly small. Every value the owner record needs — the
+#     tmux server pid (a `tmux display-message` round trip, measured at 100-600
+#     ms on this loaded machine), the clock, this process's start token — is
+#     resolved BEFORE the mkdir. Between mkdir(2) and the printf there is now
+#     exactly one shell builtin and no fork, no tmux call, and no `date`.
+#   * A lock that IS ownerless is reclaimable once it is older than the orphan
+#     grace, so even a kill landing inside that window cannot wedge the store.
+#     Below the grace it is treated as BUSY, because a taker may legitimately be
+#     mid-write — the grace is what keeps property "never steal from a live
+#     worker" true for the one instant when the owner file does not yet exist.
+#   * If the owner write FAILS (full disk, read-only store, anything), the lock
+#     is released rather than held: an ownerless lock is never left behind on
+#     purpose. The old code ignored the write's status entirely.
+
+# The process identity token: `ps -o lstart=` for one pid. Single-pid `ps` is
+# ~20 ms; the multi-pid form is the one that cost 7-12 s on this machine, and it
+# is not used here. Whitespace is squeezed to '_' so the token can never contain
+# a TAB and can never be empty — '-' is the floor (§2.1: never an empty field).
+_cc_proc_start_token() {
+  local t
+  t="$(ps -o lstart= -p "$1" 2>/dev/null | tr -s '[:space:]' '_')"
+  case "${t:-}" in ''|'_') printf '%s' '-' ;; *) printf '%s' "$t" ;; esac
 }
 
+# Memoised: a process's own start time cannot change, and the socket a running
+# process is attached to cannot change either.
+_cc_lock_self_token() {
+  [ -n "${_CC_LOCK_SELF_TOKEN:-}" ] || _CC_LOCK_SELF_TOKEN="$(_cc_proc_start_token $$)"
+  printf '%s' "$_CC_LOCK_SELF_TOKEN"
+}
+_cc_lock_server_pid() {
+  [ -n "${_CC_LOCK_SERVER_PID:-}" ] || _CC_LOCK_SERVER_PID="$(_cc_server_pid)"
+  printf '%s' "$_CC_LOCK_SERVER_PID"
+}
+
+# Real-clock mtime, in seconds. BSD stat first, GNU second. Used ONLY for the
+# orphan grace, and deliberately against the REAL clock rather than _cc_now:
+# an mtime is stamped by the kernel, so comparing it to a CC_NOW the test froze
+# would produce a nonsense age.
+_cc_mtime() {
+  local m
+  m="$(stat -f %m "$1" 2>/dev/null)"
+  case "${m:-}" in ''|*[!0-9]*) m="$(stat -c %Y "$1" 2>/dev/null)" ;; esac
+  case "${m:-}" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$m"
+}
+
+# Age of a path against the real clock. Unknowable ⇒ "older than the grace",
+# which fails towards reclaimability for a directory that has no owner file.
+_cc_path_age() {
+  local m n a
+  m="$(_cc_mtime "$1")" || { printf '%s' "$((CC_LOCK_ORPHAN_GRACE_SECS + 1))"; return 0; }
+  n="$(date +%s 2>/dev/null)"
+  case "${n:-}" in ''|*[!0-9]*) printf '%s' "$((CC_LOCK_ORPHAN_GRACE_SECS + 1))"; return 0 ;; esac
+  a=$((n - m)); [ "$a" -lt 0 ] && a=0
+  printf '%s' "$a"
+}
+
+# Args: <lock-dir> <server-pid> <epoch> <start-token>. Every value is supplied
+# by the caller and already resolved: THIS FUNCTION MUST NOT FORK. It runs in
+# the mkdir→owner window, and every fork added here widens the window that
+# produces an ownerless lock.
+_cc_lock_owner_write() {
+  # The braces matter: `cmd > f 2>/dev/null` applies the redirections in order,
+  # so a FAILING `> f` is reported to the still-original stderr — the old form
+  # both swallowed the reason (its `2>/dev/null`) AND leaked the message into
+  # whatever hook was running. Wrapping puts the whole redirection under it, and
+  # the reason is recovered by the caller's LOCK-OWNER-WRITE-FAILED log line.
+  { printf '%s\t%s\t%s\t%s\n' "$$" "${2:-0}" "${3:-0}" "${4:--}" > "$1/owner"; } 2>/dev/null || return 1
+  [ -s "$1/owner" ] || return 1
+  return 0
+}
+
+# Args: <lock-dir> <server-pid> <epoch> <start-token>. 0 = held, 1 = not held
+# (and nothing left behind).
 _cc_lock_take() {
+  if ! _cc_lock_owner_write "$1" "$2" "$3" "$4"; then
+    # Never hold what we cannot stamp. An unstamped lock is the wedge.
+    rmdir "$1" 2>/dev/null || rm -rf "$1" 2>/dev/null
+    _cc_log "LOCK-OWNER-WRITE-FAILED $1 — released rather than held ownerless"
+    return 1
+  fi
   _CC_LOCK_LAST="$1"
-  _cc_lock_owner_write "$_CC_LOCK_LAST"
   # Only when the caller has no handler of its own. Installing one
   # unconditionally would silently REPLACE the caller's cleanup — cc_freeze.sh
   # and cc_thaw.sh both remove a work directory there, and both already release
   # locks from it. (Observed: a test's own kill-server trap was clobbered this
   # way and its tmux server outlived the run.)
   [ -n "$(trap -p EXIT)" ] || trap '_cc_lock_release_all' EXIT HUP INT TERM
+  return 0
 }
 
 # Args: <lock-root> <name>. Returns 0 when held, 1 when BUSY (caller reports
 # BUSY and exits 0 having done nothing — an occupied lock is not an error).
 _cc_lock_acquire() {
-  local root="$1" name="$2" dir owner opid oepoch now age
+  local root="$1" name="$2" dir now spid tok
+  # A name that resolves back to the root, or out of it, would make the reclaim
+  # below `rm -rf` the container of every sibling lock.
+  case "${name:-}" in
+    ''|.|..|*/*) _cc_log "LOCK-BAD-NAME '${name:-}' under '$root' — refusing"; return 1 ;;
+  esac
   dir="$root/$name"
   _CC_LOCK_ROOT="$root"
   mkdir -p "$root" 2>/dev/null || return 1
-  if mkdir "$dir" 2>/dev/null; then _cc_lock_take "$dir"; return 0; fi
 
-  owner="$(cat "$dir/owner" 2>/dev/null)"
-  IFS='	' read -r opid _ oepoch <<EOF
+  # EVERY fork this acquisition needs happens HERE, before the mutex exists.
+  now="$(_cc_now)"
+  spid="$(_cc_lock_server_pid)"
+  tok="$(_cc_lock_self_token)"
+
+  if mkdir "$dir" 2>/dev/null; then
+    # ── the window ── (one builtin, no fork)
+    if [ -n "${CC_LOCK_FAIL_AFTER:-}" ] && [ "$CC_LOCK_FAIL_AFTER" = "mkdir" ]; then
+      # Test escape (§3): die exactly inside the window, the way a SIGKILLed
+      # worker does, so the ownerless state under test is produced by the REAL
+      # acquisition path and not by a hand-made directory.
+      kill -9 $$
+    fi
+    _cc_lock_take "$dir" "$spid" "$now" "$tok" && return 0
+    return 1
+  fi
+  _cc_lock_reclaim "$dir" "$name" "$now" "$spid" "$tok"
+}
+
+# The reclaim decision. Args: <dir> <name> <now> <server-pid> <start-token>.
+# Returns 0 only if the lock was reclaimed AND retaken.
+_cc_lock_reclaim() {
+  local dir="$1" name="$2" now="$3" spid="$4" tok="$5"
+  local owner="" opid ospid oepoch otok age why="" live_tok
+
+  # `read < file` is a builtin: no `cat`, no fork, on a path that runs whenever
+  # the lock is contended.
+  [ -f "$dir/owner" ] && IFS= read -r owner < "$dir/owner" 2>/dev/null
+
+  if [ -z "$owner" ]; then
+    # Ownerless: the mkdir→owner-write window, or a directory that never went
+    # through this protocol at all.
+    age="$(_cc_path_age "$dir")"
+    if [ "$age" -lt "$CC_LOCK_ORPHAN_GRACE_SECS" ]; then
+      return 1    # BUSY: a taker may be mid-write this instant. Never steal it.
+    fi
+    why="no owner file after ${age}s (crashed inside the mkdir→owner window)"
+  else
+    IFS='	' read -r opid ospid oepoch otok <<EOF
 $owner
 EOF
-  now="$(_cc_now)"
-  age=0
-  case "${oepoch:-}" in
-    ''|*[!0-9]*) age=$((CC_LOCK_STALE_SECS + 1)) ;;
-    *) age=$((now - oepoch)) ;;
-  esac
-  case "${opid:-}" in
-    ''|*[!0-9]*) : ;;
-    *) kill -0 "$opid" 2>/dev/null && [ "$age" -le "$CC_LOCK_STALE_SECS" ] && return 1 ;;
-  esac
-  # Dead owner, or an owner file older than the stale window: reclaim ONCE.
-  _cc_log "LOCK-RECLAIM $name (owner pid=${opid:-none} age=${age}s)"
+    case "${oepoch:-}" in
+      ''|*[!0-9]*) age=$((CC_LOCK_MAX_AGE_SECS + 1)) ;;
+      *) age=$((now - oepoch)) ;;
+    esac
+    [ "$age" -lt 0 ] && age=0
+
+    case "${opid:-}" in
+      ''|*[!0-9]*)
+        why="owner field '${opid:-}' is not a pid" ;;
+      *)
+        if ! kill -0 "$opid" 2>/dev/null; then
+          why="owner pid $opid is dead"
+        else
+          case "${otok:-}" in
+            ''|'-')
+              # A legacy three-field owner file, or a `ps` that would not answer
+              # when the lock was taken. Identity is UNCONFIRMABLE — and this is
+              # the ONLY branch in which age decides anything.
+              #
+              # THE AGE RULES LIVE HERE AND NOWHERE ELSE. The stale window and
+              # the ceiling both apply to a lock we cannot positively identify,
+              # and neither applies to one we can: "a lock held by a LIVE worker
+              # must never be stolen" is unconditional, and an age-based rule
+              # layered on top of a confirmed-live owner is precisely the naive
+              # timeout this rewrite exists to remove. (Caught by
+              # tests/save_lock_mutex.sh [3] on the first run of this code: a
+              # 24 h ceiling applied unconditionally stole a live holder's lock
+              # the moment the clock was pushed forward.)
+              if [ "$age" -gt "$CC_LOCK_MAX_AGE_SECS" ]; then
+                why="unidentifiable owner pid $opid, ${age}s old — past the ${CC_LOCK_MAX_AGE_SECS}s ceiling"
+              elif [ "$age" -gt "$CC_LOCK_STALE_SECS" ]; then
+                why="owner pid $opid cannot be identified (no start token) and the lock is ${age}s old"
+              fi ;;
+            *)
+              live_tok="$(_cc_proc_start_token "$opid")"
+              [ "$live_tok" != "$otok" ] && \
+                why="pid $opid was RECYCLED (starts '$live_tok', lock recorded '$otok')" ;;
+          esac
+          if [ -z "$why" ]; then
+            case "${ospid:-}" in
+              ''|*[!0-9]*|0) : ;;
+              *) case "$spid" in
+                   0|"$ospid") : ;;
+                   *) why="lock belongs to tmux server $ospid, we are talking to $spid" ;;
+                 esac ;;
+            esac
+          fi
+        fi ;;
+    esac
+  fi
+
+  # CONFIRMED LIVE. Not stolen, not logged as an anomaly: an occupied lock is
+  # normal operation and the caller reports BUSY.
+  [ -n "$why" ] || return 1
+
+  # Belt and braces before an `rm -rf`: the root is the container of every
+  # sibling lock and must never be removed as if it were one.
+  case "$dir" in ''|*/) return 1 ;; esac
+  [ "$dir" = "${_CC_LOCK_ROOT:-}" ] && return 1
+  [ "$dir" = "$(dirname "$dir")" ] && return 1
+
+  _cc_log "LOCK-RECLAIM $name: $why"
   rm -rf "$dir" 2>/dev/null
-  if mkdir "$dir" 2>/dev/null; then _cc_lock_take "$dir"; return 0; fi
+  if mkdir "$dir" 2>/dev/null; then
+    _cc_lock_take "$dir" "$spid" "$now" "$tok" && return 0
+  fi
   return 1
 }
 
@@ -232,6 +457,9 @@ EOF
 _cc_lock_release() {
   local d="${1:-${_CC_LOCK_LAST:-}}"
   [ -n "$d" ] || return 0
+  # The root is not a lock (see the section header): releasing it would delete
+  # every sibling lock that is currently held.
+  [ "$d" = "${_CC_LOCK_ROOT:-}" ] && return 0
   rm -rf "$d" 2>/dev/null
   [ "$d" = "${_CC_LOCK_LAST:-}" ] && _CC_LOCK_LAST=""
   return 0

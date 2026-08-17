@@ -151,6 +151,45 @@ cc_compose_relaunch() {
   printf '%s' "${out#*	}"
 }
 
+# Drop from <args> any VALUELESS long flag that <base> already supplies.
+#
+# WHY. The plain-claude path composes `$base_cmd $args`, where base_cmd is the
+# configured launcher (`claude --dangerously-skip-permissions`, or an alias that
+# expands to it) and args are the snapshot row's own arguments — which contain
+# that same flag, because the row was itself produced by a previous relaunch.
+# The flag therefore appears twice. The next save captures BOTH copies, the next
+# restore carries both across on top of base_cmd again, and the count grows by
+# one every cycle. Measured on this machine: 21 live Claude processes were
+# running with `--dangerously-skip-permissions` repeated FOUR times, and 19
+# snapshot rows recorded it four times. Left alone it grows without bound and
+# pollutes every future snapshot.
+#
+# Only VALUELESS flags are dropped. A flag that takes a value is repeatable with
+# different values (`--add-dir a --add-dir b`), and removing one occurrence
+# would silently discard its value and shift the next token into a flag
+# position. A token counts as valueless only when the token that follows it is
+# absent or is itself an option, so `--model sonnet` is never touched.
+_cc_drop_flags_already_in() { # <base> <args> -> args with base's own flags removed
+  local base="$1" out="" tok next
+  set -- $2
+  while [ "$#" -gt 0 ]; do
+    tok="$1"; shift
+    next="${1:-}"
+    case "$tok" in
+      --*=*) ;;                      # carries its own value — always keep
+      --*)
+        case "$next" in
+          ''|-*)                     # valueless: nothing or another option follows
+            case " $base " in
+              *" $tok "*) continue ;;    # base already supplies it
+            esac ;;
+        esac ;;
+    esac
+    out="$out $tok"
+  done
+  printf '%s' "${out# }"
+}
+
 # kind <TAB> command
 cc_compose_relaunch_kv() {
   local base_cmd="$1" claudish_cmd="$2" typed_b64="$3" full_cmd="$4" \
@@ -180,6 +219,9 @@ cc_compose_relaunch_kv() {
       # Keep the configured launcher (it carries the env wrapper), add the
       # pane's own arguments.
       args="$(_cc_args_after_exec "$stripped")"
+      # …minus anything the configured launcher already supplies, or the flag
+      # accumulates one extra copy per restore cycle (see the helper above).
+      args="$(_cc_drop_flags_already_in "$base_cmd" "$args")"
       if [ -n "$args" ]; then
         relaunch="$base_cmd $args"
         _CC_RELAUNCH_KIND="default+args:$args"
