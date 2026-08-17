@@ -36,7 +36,8 @@ RESTORE_SCRIPT="$SCRIPT_DIR/post_restore.sh"
 pass=0
 fail=0
 
-_tmux() { tmux -L "$SOCKET" "$@"; }
+case "$SOCKET" in default|"") echo "unsafe socket [$SOCKET]"; exit 1 ;; esac
+_tmux() { tmux -L "$SOCKET" -f /dev/null "$@"; }
 
 _teardown() {
   _tmux kill-server 2>/dev/null
@@ -97,7 +98,7 @@ echo "Target pane: $target_id (snapshot says window $stale_win, killed window $k
 # The SAVE side. Without this, any save resurrect performs lands in the user's
 # live directory: helpers.sh defaults there whenever the option is unset.
 _tmux set-option -g @resurrect-dir "$RD"
-cc_guard_resurrect_dir "$RD" tmux -L "$SOCKET"
+cc_guard_resurrect_dir "$RD" tmux -L "$SOCKET" -f /dev/null
 _tmux set-option -g @claude-continuity-claude-cmd "echo"
 _tmux set-option -g @claude-continuity-pending-dir "$QD"
 _tmux set-option -g @claude-continuity-log-file "$LOG"

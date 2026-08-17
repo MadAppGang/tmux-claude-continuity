@@ -186,13 +186,27 @@ rm -f "$LD/${PANE_ID#%}"
 echo "[4c] ONE SESSION, ONE PANE: a duplicate id is dropped from the extra pane"
 rm -f "$PD/by-pid/"*.session-id
 SECOND="$(_tmux split-window -t work -d -P -F '#{pane_id}' "sh -c 'sh -c \"sleep 600; :\"; :'")"
-for _ in 1 2 3 4 5 6 7 8 9 10; do
+# Wait for the tree to SETTLE, not merely to be non-empty. `sh -c 'sh -c "…"; :'`
+# passes through short-lived intermediate processes while it forks, and the old
+# loop accepted the first pid it saw. Catching a transient gives a SEC_CHILD that
+# has already exited by the time the sidecar is written; pre_save then garbage
+# collects that sidecar as a dead pid, leaving ONE claimant instead of two — so
+# the duplicate this section exists to test never occurs, while the "recorded
+# exactly once" assertion below still passes VACUOUSLY. Measured flake rate
+# before this fix: 2 runs in 4. The tell was the pid distance — a settled child
+# sat ~16 pids from its parent, a transient one 3.
+# Requiring the SAME pid twice, with a gap, and still alive, rejects transients.
+SEC_CHILD=""
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
   SEC_PID="$(_tmux display-message -p -t "$SECOND" '#{pane_pid}')"
-  SEC_CHILD="$(pgrep -P "${SEC_PID:-0}" 2>/dev/null | head -1)"
-  [ -n "$SEC_CHILD" ] && break
+  _c1="$(pgrep -P "${SEC_PID:-0}" 2>/dev/null | head -1)"
+  [ -n "$_c1" ] || { sleep 0.3; continue; }
+  sleep 0.4
+  _c2="$(pgrep -P "${SEC_PID:-0}" 2>/dev/null | head -1)"
+  if [ "$_c1" = "$_c2" ] && kill -0 "$_c1" 2>/dev/null; then SEC_CHILD="$_c1"; break; fi
   sleep 0.3
 done
-if [ -n "$SEC_CHILD" ]; then ok "second pane's process resolved ($SECOND -> $SEC_CHILD)"
+if [ -n "$SEC_CHILD" ]; then ok "second pane's process resolved and settled ($SECOND -> $SEC_CHILD)"
 else bad "second pane's process resolved" "SEC_PID=$SEC_PID SEC_CHILD=empty — the duplicate would never exist"; fi
 SID_DUP="55555555-5555-4555-8555-555555555555"
 echo "$SID_DUP" > "$PD/by-pid/$GRANDCHILD.session-id"
@@ -204,6 +218,17 @@ P2="$(printf '%s' "$COORDS2" | cut -f3)"
 { printf 'pane\t%s\t%s\t1\t:*\t%s\t\xe2\x9c\xb3 Claude Code\t:%s\t1\tsh\t:sh\n' "$SESS" "$WIN" "$PIDX" "$TD"
   printf 'pane\t%s\t%s\t1\t:*\t%s\t\xe2\x9c\xb3 Claude Code\t:%s\t1\tsh\t:sh\n' "$S2" "$W2" "$P2" "$TD"
 } > "$SNAP"
+# ANTI-VACUITY. "Recorded exactly once" is satisfied just as well by a run in
+# which only ONE pane ever claimed the id — which is precisely what happened on
+# the flaky runs. Both processes must be alive at the instant the save reads
+# them, or this section proves nothing about deduplication.
+if kill -0 "$GRANDCHILD" 2>/dev/null && kill -0 "$SEC_CHILD" 2>/dev/null; then
+  ok "both claimants are alive, so a duplicate genuinely exists to resolve"
+else
+  bad "both claimants are alive" \
+    "grand=$GRANDCHILD($(kill -0 "$GRANDCHILD" 2>/dev/null && echo live || echo DEAD)) sec=$SEC_CHILD($(kill -0 "$SEC_CHILD" 2>/dev/null && echo live || echo DEAD)) — the dedup assertions below would pass vacuously"
+fi
+
 CC_SAVE_LOG="$TD/save.log" PATH="$BIN:$PATH" bash "$PRE_SAVE" "$SNAP"
 assert_eq "the id is recorded exactly once across both panes" \
   "$(grep -o ";CLAUDE_SID=$SID_DUP" "$SNAP" | wc -l | tr -d ' ')" "1"
