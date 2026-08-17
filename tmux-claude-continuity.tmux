@@ -63,6 +63,22 @@ tmux set-option -g @resurrect-hook-post-restore-all \
 tmux set-option -g @resurrect-hook-post-save-layout \
   "${CURRENT_DIR}/scripts/pre_save.sh \"\$1\""
 
+# The AFTER-PUBLICATION check. post-save-layout above runs at save.sh:246, which
+# is BEFORE the `files_differ` / `ln -fs … last` at :247-251 — so whether `last`
+# ends up dangling is decided after that hook has already returned, and no amount
+# of work inside it can guarantee the outcome. resurrect calls post-save-all at
+# save.sh:259, after the symlink has been moved, which is the only point where
+# the result can actually be checked.
+#
+# Measured against the real save.sh with ten concurrent saves: vanilla resurrect
+# leaves `last` unrestorable 3 runs in 3; the :246 guards alone cut that to 1 in
+# 3 (reproduced here as a 1-in-3 flake in tests/save_lock_mutex.sh, where `last`
+# simply vanished); with this hook wired it is 0. `--verify-last` was written for
+# exactly this and was already implemented in pre_save.sh — it had just never
+# been registered, so the last third of the failure was never being caught.
+tmux set-option -g @resurrect-hook-post-save-all \
+  "${CURRENT_DIR}/scripts/pre_save.sh --verify-last"
+
 # The sleep manager. prefix + Z — Z is unbound in default tmux (prefix + z is
 # zoom; the key table is case-sensitive), so this takes nothing away.
 #

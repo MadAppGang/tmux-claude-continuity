@@ -98,6 +98,7 @@ _CC_C_OK=0; _CC_C_BAD=0; _CC_C_REASON=""; _CC_C_SIDS=0; _CC_C_RSS=0; _CC_C_ALREA
 _cc_usage() {
   printf 'usage: cc_freeze.sh freeze [--reason manual|auto] [--force] [--no-save] <target>...\n' >&2
   printf '       cc_freeze.sh sweep [--dry-run]\n' >&2
+  printf '       cc_freeze.sh save                  (serialised resurrect save)\n' >&2
   printf '       <target> ::= %%12 | session:index.pane | @37 | session:index | session:\n' >&2
 }
 
@@ -986,27 +987,78 @@ _cc_container_line() {
     "$kind" "${tgt:--}" "$verdict" "$ok" "$refused" "$failed" "$busy" "$total"
 }
 
-# ── One save request per invocation (§3.1.13) ────────────────────────────────
-# v1 issued one per target; with nothing locking resurrect's save, concurrent
-# save.sh runs race `ln -fs … last` and the winner can be a pre-freeze dump.
-_cc_request_save() {
-  local s
-  [ "$NO_SAVE" = "1" ] && return 0
-  [ "${CC_NO_SAVE:-0}" = "1" ] && return 0
+# ── The serialised save (§3.1.13, Bug B) ─────────────────────────────────────
+# THE PROBLEM. tmux-resurrect names its snapshot `tmux_resurrect_<%Y%m%dT%H%M%S>
+# .txt` — ONE SECOND of resolution — and `save_all` then does:
+#
+#     fetch_and_dump_grouped_sessions >  "$f"      # TRUNCATE
+#     dump_panes                      >> "$f"
+#     dump_windows                    >> "$f"
+#     dump_state                      >> "$f"
+#     execute_hook post-save-layout   "$f"         # ← pre_save.sh runs HERE
+#     files_differ "$f" last && ln -fs "$f" last
+#
+# Two saves in the same second share `$f`. B's truncate lands between A's
+# `dump_panes` and A's `dump_windows`, or A's and B's appends interleave — which
+# is exactly what was measured on the live machine: a snapshot with 146 pane
+# rows for 73 live panes (every row doubled) and others with `panes=36
+# windows=0` (truncated). tmux runs continuum's check every 5 s while a save on
+# that machine took ~20 s, so overlap was the steady state, not the exception:
+# 37 continuum_save.sh + 18 save.sh + 3 pre_save.sh alive at once.
+#
+# WHERE THE MUTEX HAS TO LIVE. Not in pre_save.sh. That hook is
+# `post-save-layout`, and by the time it runs all four dumps are already on
+# disk — a mutex there can stop a bad snapshot from being PUBLISHED (it runs
+# before `files_differ`/`ln -fs last`, which is the last moment at which a save
+# can still be made a no-op) but it cannot stop a second DUMP from starting.
+# resurrect exposes no pre-save hook at all, so the only place a dump can be
+# prevented is UPSTREAM OF save.sh — in whatever invokes it. This function is
+# the plugin's invoker, so this is where the gate goes: the lock is taken
+# BEFORE save.sh is exec'd and held, in the FOREGROUND, until it has returned.
+# A second request while one is in flight finds a confirmed-live owner, exits 0
+# and dumps nothing.
+#
+# CC_SAVE_LOCK_HELD is exported into save.sh's environment so that pre_save.sh —
+# which runs as save.sh's child and would otherwise contend with its own
+# grandparent — knows the save it belongs to already holds the mutex.
+_cc_save_locked() {
+  local s lock rc=0
+  if ! _cc_lock_acquire "$(cc_store_lock_root)" save; then
+    _cc_log "SAVE skipped: a save is already in progress (BUSY, nothing dumped)"
+    return 0
+  fi
+  lock="$_CC_LOCK_LAST"
   if [ -n "${CC_SAVE_CMD:-}" ]; then
-    $TMUX_CMD run-shell -b "$CC_SAVE_CMD" 2>/dev/null
+    CC_SAVE_LOCK_HELD="$lock" sh -c "$CC_SAVE_CMD" >/dev/null 2>&1 || rc=$?
+    _cc_lock_release "$lock"
     return 0
   fi
   for s in "$CURRENT_DIR/../../tmux-resurrect/scripts/save.sh" \
            "$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh" \
            "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/plugins/tmux-resurrect/scripts/save.sh"; do
     if [ -x "$s" ]; then
-      $TMUX_CMD run-shell -b "$s" 2>/dev/null
-      _cc_log "SAVE-REQUESTED $s"
+      _cc_log "SAVE-BEGIN $s"
+      CC_SAVE_LOCK_HELD="$lock" "$s" quiet >/dev/null 2>&1 || rc=$?
+      _cc_log "SAVE-END rc=$rc"
+      _cc_lock_release "$lock"
       return 0
     fi
   done
+  _cc_lock_release "$lock"
   _cc_log "SAVE-UNAVAILABLE: no tmux-resurrect save.sh found; the next 15-minute save records the freeze"
+  return 0
+}
+
+# ── One save request per invocation (§3.1.13) ────────────────────────────────
+# v1 issued one per target; with nothing locking resurrect's save, concurrent
+# save.sh runs race `ln -fs … last` and the winner can be a pre-freeze dump.
+# The request is now routed through `cc_freeze.sh save`, which holds the mutex
+# for the whole dump. Detached, because a freeze must not block on a 20 s save.
+_cc_request_save() {
+  [ "$NO_SAVE" = "1" ] && return 0
+  [ "${CC_NO_SAVE:-0}" = "1" ] && return 0
+  $TMUX_CMD run-shell -b "'$CURRENT_DIR/cc_freeze.sh' save" 2>/dev/null
+  _cc_log "SAVE-REQUESTED (serialised)"
   return 0
 }
 
@@ -1223,6 +1275,12 @@ case "$CMD" in
   sweep)
     _cc_sweep
     exit "$_CC_HARD_RC" ;;
+  save)
+    # The serialised save entry point. Always exits 0: "a save is already in
+    # flight" is normal operation, not a failure, and this runs from
+    # `run-shell -b` where a non-zero exit reads as a failed hook.
+    _cc_save_locked
+    exit 0 ;;
   ''|-h|--help|help)
     _cc_usage
     [ -z "$CMD" ] && exit 1
