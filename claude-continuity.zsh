@@ -61,32 +61,35 @@ _CC_LAUNCH_FILE="${_CC_LAUNCH_DIR}/${TMUX_PANE#%}"
 # when this file is absent — panes launched from a script, from `tmux new-window
 # 'claude …'`, or from a shell without this hook never pass through preexec.
 #
-# This runs on EVERY interactive command, so it must not fork. Command
-# resolution uses zsh's own tables ($aliases/$functions/$commands) rather than
-# `whence` in a $( ) subshell, and the verdict per command word is memoized.
-typeset -gA _cc_launcher_memo
-
+# EVERY command is recorded. There is deliberately no test for "is this a Claude
+# launcher" here any more.
+#
+# There used to be one: the first word was resolved through $aliases/$functions/
+# $commands and the result string searched for "claude". That asks the wrong
+# question. It is a test on a NAME, so it answers correctly only for launchers
+# that happen to spell it — `c` matched because its alias TEXT contains "claude",
+# while `ck`, an executable at ~/bin/ck, did not and recorded nothing at all.
+# Every wrapper, shell function and `env FOO=1 claude` form fails it the same
+# way, and teaching it one more name just moves the goalposts to the next one.
+#
+# The question that actually matters is not "is this word named claude" but "is
+# this pane still running what it launched" — and the SAVE side already knows
+# that, from the pane's live process. So the split is:
+#
+#   here      record the last thing typed, unconditionally, no interpretation
+#   pre_save  keep it only for a pane still running something
+#
+# That is what makes a finished one-shot safe: type `terraform apply`, let it
+# finish, and the pane is back at a shell — so the save drops the recording and
+# no restore can ever replay it. It also means any launcher works with no
+# configuration: ck, cop, a function, a wrapper written next month.
+#
+# Cost of the change: one small write per interactive command instead of a
+# memoized table lookup. No fork — `print -r -- … > file` is a builtin redirect.
 _claude_continuity_record() {
   emulate -L zsh
   local line="$1"
   [[ -n "$line" ]] || return 0
-
-  local word="${line%%[[:space:]]*}"
-  [[ -n "$word" ]] || return 0
-
-  local verdict="${_cc_launcher_memo[$word]-}"
-  if [[ -z "$verdict" ]]; then
-    # What would this word actually run? Alias text, function name, or binary.
-    local resolved="${aliases[$word]-}${functions[$word]:+$word}${commands[$word]-}"
-    case " $resolved " in
-      *' claude '*|*'/claude '*|*'/claude'|*' claudish '*|*'/claudish '*|*'/claudish'|*'claudish '*)
-        verdict=y ;;
-      *) verdict=n ;;
-    esac
-    case "$word" in claude|claudish) verdict=y ;; esac
-    _cc_launcher_memo[$word]="$verdict"
-  fi
-  [[ "$verdict" = y ]] || return 0
 
   [[ -d "$_CC_LAUNCH_DIR" ]] || mkdir -p "$_CC_LAUNCH_DIR" 2>/dev/null || return 0
   # First line only: the snapshot is a line-oriented format, and a continuation
@@ -133,6 +136,36 @@ _claude_continuity_resume() {
   eval "${cmd}"
 }
 
+# ── Clear the recording when the command finishes ────────────────────────────
+# preexec records what is about to run; this removes it the moment the shell is
+# back at a prompt. The file therefore exists ONLY while a command is actually
+# running, which is exactly the set of things a restore should bring back.
+#
+# That invariant is what makes recording unconditionally safe. Type
+# `terraform apply`, let it finish, and the recording is gone before the next
+# save can see it — so no restore can replay a completed one-shot. Nothing has to
+# guess from a process table, and no program needs to be on an allowlist: if it
+# is still running when the snapshot is taken, it comes back; if it finished, it
+# does not.
+#
+# Ordering with _claude_continuity_resume matters. That hook launches claude as a
+# CHILD and blocks in `eval`, so this precmd does not run again until claude
+# exits — the recording stays in place for the whole life of the session, which
+# is the point.
+#
+# Fork-free, like the rest of the hot path: `rm -f` here would be a fork, so this
+# uses zsh's own unlink via the `zsh/files` module when available and falls back
+# to a builtin-only truncate otherwise.
+zmodload -F zsh/files b:zf_rm 2>/dev/null
+if (( $+builtins[zf_rm] )); then
+  _claude_continuity_clear() { zf_rm -f -- "$_CC_LAUNCH_FILE" 2>/dev/null }
+else
+  # No zsh/files: emptying the file is the fork-free equivalent. pre_save treats
+  # an empty recording as absent.
+  _claude_continuity_clear() { : > "$_CC_LAUNCH_FILE" 2>/dev/null }
+fi
+
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd _claude_continuity_resume
+add-zsh-hook precmd _claude_continuity_clear
 add-zsh-hook preexec _claude_continuity_preexec
