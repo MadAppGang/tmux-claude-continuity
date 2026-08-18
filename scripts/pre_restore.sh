@@ -61,19 +61,60 @@ fi
 
 # Same reasoning for the recorded launch commands: they are keyed by pane id too,
 # so a dead server's file would be attributed to whatever pane inherits that id.
-# Safe to drop — the snapshot already carries the commands for this restore, and
-# each restored pane re-records its own on relaunch.
+#
+# But this must NOT be a blanket delete, and it was. This script runs from TWO
+# places: the resurrect pre-restore hook, and a bare `run-shell` in .tmux.conf
+# that fires on EVERY config parse — every `tmux source-file`, not only a
+# restore. A blanket purge therefore destroyed every LIVE pane's recorded command
+# on any config reload, with no restore following to re-record it.
+#
+# Measured on 2026-08-18: 47 files purged at 12:05:49 with no BOOT VERDICT after
+# it, and the 21:19 snapshot carried CLAUDE_CMD on 1 of 41 Claude rows. Every
+# restore then logged `cmd=default`, so @claude-continuity-claude-cmd silently
+# carried 100% of the relaunches — which made the typed-command path look like it
+# had never worked, when in fact it worked and was being erased.
+#
+# The discriminator is the SERVER START TIME. A file written by a shell in this
+# server is newer than the server; a dead server's residue is older. That keeps
+# live panes intact across a config reload and still drops stale ids on a fresh
+# server, where pane ids restart at %0 and would otherwise collide.
+#
+# `#{start_time}` needs tmux >= 3.2. When it is missing or unparseable the
+# blanket purge is the correct fallback: losing recorded commands is recoverable,
+# resuming a dead session's SID into the wrong pane is not.
 launch_dir="$($TMUX_CMD show-option -gqv @claude-continuity-launch-dir 2>/dev/null)"
 launch_dir="${launch_dir:-$HOME/.config/tmux-claude/launch}"
+
+_cc_server_start="$($TMUX_CMD display-message -p '#{start_time}' 2>/dev/null)"
+case "$_cc_server_start" in
+  ''|*[!0-9]*) _cc_server_start="" ;;
+esac
+
 _cc_lpurged=0
+_cc_lkept=0
 if [ -d "$launch_dir" ]; then
   for f in "$launch_dir"/*; do
     [ -f "$f" ] || continue
     case "${f##*/}" in
       ''|*[!0-9]*) continue ;;
     esac
+    if [ -n "$_cc_server_start" ]; then
+      # BSD stat first (macOS), GNU second — the plugin runs on both.
+      _cc_mtime="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)"
+      case "$_cc_mtime" in
+        ''|*[!0-9]*) _cc_mtime=0 ;;
+      esac
+      if [ "$_cc_mtime" -ge "$_cc_server_start" ]; then
+        _cc_lkept=$((_cc_lkept + 1))
+        continue
+      fi
+    fi
     rm -f "$f" && _cc_lpurged=$((_cc_lpurged + 1))
   done
 fi
-_cc_log "pre_restore: purged $_cc_lpurged stale launch-command file(s) from $launch_dir"
+if [ "$_cc_lkept" -gt 0 ]; then
+  _cc_log "pre_restore: purged $_cc_lpurged stale launch-command file(s) from $launch_dir (kept $_cc_lkept written in this server)"
+else
+  _cc_log "pre_restore: purged $_cc_lpurged stale launch-command file(s) from $launch_dir"
+fi
 exit 0
