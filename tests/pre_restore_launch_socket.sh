@@ -179,5 +179,5 @@ else
      "$REAL_LD changed — a test pane resolved the DEFAULT dirs and wrote there"
 fi
 
-printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
+printf '\n  RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

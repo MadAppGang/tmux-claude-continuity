@@ -190,5 +190,5 @@ else
      "pending: $(ls "$TD/pending" 2>/dev/null | tr '\n' ' ') launch: $(present)"
 fi
 
-printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
+printf '\n  RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
