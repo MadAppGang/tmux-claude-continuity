@@ -86,6 +86,13 @@ launch_dir="$($TMUX_CMD show-option -gqv @claude-continuity-launch-dir 2>/dev/nu
 launch_dir="${launch_dir:-$HOME/.config/tmux-claude/launch}"
 
 _cc_server_start="$($TMUX_CMD display-message -p '#{start_time}' 2>/dev/null)"
+# Trim surrounding whitespace BEFORE validating. `$( )` strips trailing newlines
+# but not spaces, and the all-digits test rejects a padded value — which would
+# silently fall back to the blanket purge and reinstate the very bug this guard
+# exists to prevent. Failing safe here means failing back to the broken
+# behaviour, so the parse has to be forgiving. Fork-free: this is a hook.
+_cc_server_start="${_cc_server_start#"${_cc_server_start%%[![:space:]]*}"}"
+_cc_server_start="${_cc_server_start%"${_cc_server_start##*[![:space:]]}"}"
 case "$_cc_server_start" in
   ''|*[!0-9]*) _cc_server_start="" ;;
 esac
