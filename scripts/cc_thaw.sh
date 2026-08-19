@@ -131,7 +131,6 @@ _cc_exit_code() {
 pending_dir="$(_cc_opt @claude-continuity-pending-dir "$HOME/.config/tmux-claude/pending")"
 panes_dir="$(_cc_opt @claude-continuity-panes-dir "$HOME/.config/tmux-claude/panes")"
 by_pid_dir="${panes_dir}/by-pid"
-claude_cmd="$(_cc_opt @claude-continuity-claude-cmd claude)"
 claudish_cmd="$(_cc_opt @claude-continuity-claudish-cmd claudish)"
 # See cc_freeze.sh: with `-f /dev/null` these options are unset and default to
 # the LIVE sidecar directories, which a thaw writes pending files into.
@@ -321,12 +320,11 @@ _cc_tombstone_title() {
 # the frozen banner. Resolve it the way tmux resolves a new pane's command:
 # `default-command` if the user set one, else the validated $SHELL as a login
 # shell.
-_cc_fresh_shell() {
-  local s
-  s="$($TMUX_CMD show-option -gqv default-command 2>/dev/null)"
-  [ -n "$s" ] || s="$(_cc_shquote "$(_cc_tombstone_shell)") -l"
-  printf '%s' "$s"
-}
+#
+# _cc_fresh_shell now lives in lib/cc_proc.sh (sourced above), because the popup
+# has to show it: a pane with no recorded session is respawned with this and
+# nothing more, so this string IS its restore command and the previewer must not
+# own a second copy of it.
 
 # Re-collapse ONE pane to its tombstone. Used by the per-pane rollback, so it
 # must not depend on anything the failed thaw produced — only on the state file
@@ -467,7 +465,7 @@ __cc_thaw_pane_locked() {
     fi
     # _kv, not the plain form: the composition runs in a command substitution
     # and the kind it sets would otherwise die with that subshell.
-    relaunch="$(cc_compose_relaunch_kv "$claude_cmd" "$claudish_cmd" "$typed" "$cmd" "$replay" "$resume")"
+    relaunch="$(cc_compose_relaunch_kv "$claudish_cmd" "$typed" "$cmd" "$replay" "$resume")"
     kind="${relaunch%%	*}"
     relaunch="${relaunch#*	}"
     printf '%s\n' "$relaunch" > "${pending_dir}/${pane#%}"
@@ -652,7 +650,7 @@ __cc_thaw_legacy_locked() {
       _cc_log "DUP-SESSION $target key=$key pane=$idx: $sid is live elsewhere — relaunching without --resume"
       resume=""
     fi
-    relaunch="$(cc_compose_relaunch_kv "$claude_cmd" "$claudish_cmd" "$typed" "$cmd" "$replay" "$resume")"
+    relaunch="$(cc_compose_relaunch_kv "$claudish_cmd" "$typed" "$cmd" "$replay" "$resume")"
     kind="${relaunch%%	*}"
     relaunch="${relaunch#*	}"
     printf '%s\n' "$relaunch" > "${pending_dir}/${newid#%}"

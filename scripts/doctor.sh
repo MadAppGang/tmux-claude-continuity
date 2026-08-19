@@ -217,49 +217,38 @@ HOOKJSON
   fi
 fi
 
-# ── Check 4: claude command ─────────────────────────────────────────────────
+# ── Check 4: launch recording ───────────────────────────────────────────────
 
-section "4. Claude command (@claude-continuity-claude-cmd)"
+section "4. Launch recording (replaces @claude-continuity-claude-cmd)"
 
+# @claude-continuity-claude-cmd is gone. A pane comes back as what it WAS: the
+# command recorded by the preexec hook, or failing that its own captured
+# command. Nothing is rebuilt onto a launcher declared in tmux.conf, so the
+# useful check is no longer "is the option set" but "is the hook recording".
 if [ "$TMUX_RUNNING" = true ]; then
-  claude_cmd="$(tmux show-option -gqv @claude-continuity-claude-cmd 2>/dev/null)"
+  stale_opt="$(tmux show-option -gqv @claude-continuity-claude-cmd 2>/dev/null)"
+  if [ -n "$stale_opt" ]; then
+    warn "@claude-continuity-claude-cmd is set to '$stale_opt' but is no longer read"
+    info "Remove it from ~/.tmux.conf — panes now replay their own recorded command."
+  fi
 
-  if [ -n "$claude_cmd" ]; then
-    ok "claude command set to: $claude_cmd"
+  launch_dir="$(tmux show-option -gqv @claude-continuity-launch-dir 2>/dev/null)"
+  launch_dir="${launch_dir:-$HOME/.config/tmux-claude/launch}"
+  recorded=0
+  [ -d "$launch_dir" ] && recorded="$(find "$launch_dir" -type f -size +0 2>/dev/null | wc -l | tr -d ' ')"
+  busy="$(tmux list-panes -a -F '#{pane_current_command}' 2>/dev/null \
+            | grep -cvE '^(zsh|bash|sh|fish)$' || true)"
+
+  if [ "$recorded" -gt 0 ]; then
+    ok "$recorded pane(s) have a live launch recording ($busy pane(s) running something)"
+  elif [ "$busy" -gt 0 ]; then
+    warn "$busy pane(s) are running something but none has a recording"
+    info "Is claude-continuity.zsh sourced from ~/.zshrc? Recordings appear as you launch."
   else
-    warn "not set — defaults to 'claude'"
-    info ""
-
-    # Detect candidates
-    candidates=""
-    if command -v claude >/dev/null 2>&1; then
-      candidates="claude"
-    fi
-    # Check for 'c' alias by looking at shell rc files
-    if grep -qs "alias c=" "$HOME/.zshrc" "$HOME/.bashrc" 2>/dev/null; then
-      c_target="$(grep "alias c=" "$HOME/.zshrc" "$HOME/.bashrc" 2>/dev/null | head -1 | sed "s/.*alias c=['\"]*//" | sed "s/['\"].*//")"
-      if [ -n "$c_target" ]; then
-        candidates="${candidates:+$candidates, }c (alias for $c_target)"
-      fi
-    fi
-
-    if [ -n "$candidates" ]; then
-      info "Detected: $candidates"
-    fi
-
-    if ask_yn "Set @claude-continuity-claude-cmd? (enter command after)"; then
-      printf "    Command: "
-      read -r chosen_cmd
-      if [ -n "$chosen_cmd" ]; then
-        tmux set-option -g @claude-continuity-claude-cmd "$chosen_cmd"
-        ok "Set to: $chosen_cmd"
-        info "Add to ~/.tmux.conf for persistence:"
-        info "  set -g @claude-continuity-claude-cmd \"$chosen_cmd\""
-      fi
-    fi
+    ok "no panes are running anything, so no recordings are expected"
   fi
 else
-  warn "tmux not running — skipping claude-cmd check"
+  warn "tmux not running — skipping launch-recording check"
 fi
 
 # ── Check 5: Panes directory ────────────────────────────────────────────────

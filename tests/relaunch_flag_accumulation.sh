@@ -35,7 +35,7 @@ BASE="claude --dangerously-skip-permissions"
 SID="12345678-1234-4234-8234-123456789abc"
 
 compose() { # <full_cmd> -> the composed relaunch command
-  cc_compose_relaunch "$BASE" "claudish" "" "$1" "" "$SID"
+  cc_compose_relaunch "claudish" "" "$1" "" "$SID"
 }
 count_flag() { printf '%s' "$1" | grep -o -- '--dangerously-skip-permissions' | grep -c .; }
 
@@ -83,7 +83,7 @@ esac
 #       when the same flag name appears in the base command. Dropping it would
 #       discard the value and shift the next token into a flag position.
 BASE_WITH_VALUE="claude --model opus"
-R5="$(cc_compose_relaunch "$BASE_WITH_VALUE" "claudish" "" "claude --model sonnet --resume OLDSID" "" "$SID")"
+R5="$(cc_compose_relaunch "claudish" "" "claude --model sonnet --resume OLDSID" "" "$SID")"
 echo "    $R5"
 case "$R5" in
   *"--model sonnet"*) ok "a value-taking flag keeps its value (--model sonnet survives)" ;;
@@ -91,7 +91,7 @@ case "$R5" in
 esac
 
 # ── 6. and a repeatable value flag keeps BOTH values ────────────────────────
-R6="$(cc_compose_relaunch "claude --add-dir /a" "claudish" "" "claude --add-dir /a --add-dir /b --resume OLDSID" "" "$SID")"
+R6="$(cc_compose_relaunch "claudish" "" "claude --add-dir /a --add-dir /b --resume OLDSID" "" "$SID")"
 echo "    $R6"
 if printf '%s' "$R6" | grep -q -- '--add-dir /a' && printf '%s' "$R6" | grep -q -- '--add-dir /b'; then
   ok "a repeatable value flag keeps both of its values"

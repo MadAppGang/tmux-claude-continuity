@@ -216,7 +216,7 @@ _cc_glyphs_init
 # columns and shear the whole table.
 _cc_colour_init() {
   _CC_C_OFF=''; _CC_C_DIM=''; _CC_C_BOLD=''; _CC_C_PART=''
-  _CC_C_FROZ=''; _CC_C_ORPH=''; _CC_C_FOR=''; _CC_C_SESS=''
+  _CC_C_FROZ=''; _CC_C_ORPH=''; _CC_C_FOR=''; _CC_C_SESS=''; _CC_C_OK=''
   case "${TERM:-dumb}" in dumb|'') return 0 ;; esac
   [ "${CC_POPUP_NOCOLOR:-0}" = "1" ] && return 0
   _CC_C_OFF="$(printf '\033[0m')"
@@ -227,6 +227,10 @@ _cc_colour_init() {
   _CC_C_FROZ="$(printf '\033[36m')"        # cyan — asleep
   _CC_C_ORPH="$(printf '\033[31m')"        # red — broken tombstone
   _CC_C_FOR="$(printf '\033[35m')"         # magenta — another server's
+  # Green means exactly one thing in this UI: THIS PANE COMES BACK WITH ITS
+  # SESSION. It is never decoration — a hue that means two things is a hue that
+  # means nothing, and the restore plan is read to answer one question.
+  _CC_C_OK="$(printf '\033[32m')"          # green — resumes with its transcript
 }
 _cc_colour_init
 
@@ -1049,9 +1053,8 @@ _cc_count_scope() {   # <panes file> → "8 panes across 4 windows in 2 sessions
 #   default        the configured launcher, nothing pane-specific known
 _cc_restore_cmd_kv() {   # <full_cmd> <typed_b64> <sid> <claudish_replay>
   local base claudish
-  base="$($TMUX_CMD show-option -gqv @claude-continuity-claude-cmd 2>/dev/null)"
   claudish="$($TMUX_CMD show-option -gqv @claude-continuity-claudish-cmd 2>/dev/null)"
-  cc_compose_relaunch_kv "${base:-claude}" "${claudish:-claudish}" "$2" "$1" "$4" "$3"
+  cc_compose_relaunch_kv "${claudish:-claudish}" "$2" "$1" "$4" "$3"
 }
 
 # The typed command for a LIVE pane, as captured by the preexec hook. Same file
@@ -1063,26 +1066,212 @@ _cc_live_typed_b64() {   # <%N>
   _cc_b64 < "$f"
 }
 
-# The live full command: the deepest descendant of the pane that looks like a
-# Claude launcher, else the pane's own process. One ps, filtered in awk — see
-# cc_proc_rss_sum for why `ps -p <list>` is avoided on this platform.
-_cc_live_full_cmd() {    # <%N>
-  local pid
-  pid="$($TMUX_CMD display-message -p -t "$1" '#{pane_pid}' 2>/dev/null)"
-  case "${pid:-}" in ''|*[!0-9]*) return 1 ;; esac
-  ps -axo pid=,ppid=,command= 2>/dev/null | awk -v root="$pid" '
-    { c = $0; sub(/^[ ]*[0-9]+[ ]+[0-9]+[ ]+/, "", c); cmd[$1] = c; par[$1] = $2 }
-    END {
-      best = ""; own = cmd[root]
-      for (p in cmd) {
-        q = p; d = 0
-        while (q != "" && q != "0" && q != "1" && d < 16) {
-          if (q == root) { if (cmd[p] ~ /claude|claudish/) best = cmd[p]; break }
-          q = par[q]; d++
-        }
-      }
-      print (best != "" ? best : own)
-    }'
+# ── The restore plan ─────────────────────────────────────────────────────────
+# A CONTAINER row must answer the same question for every pane beneath it,
+# because a container is the row the freeze and the wake are actually pressed
+# on: "what will this do to my eight panes" is the question, and answering it
+# one pane at a time is not answering it.
+#
+# The plan is fed THE INPUTS A FREEZE WOULD RECORD. The first version of this
+# preview reconstructed them from the screen instead, and every difference
+# produced a DIFFERENT COMMAND from the one a wake would run:
+#
+#   * the launcher argv is the pane's DEPTH-1 CHILD — what cc_proc_pane_cmd
+#     writes into ;CMD= — not the deepest claude-looking descendant. For
+#     `op run … -- claude` those are two different processes, and they compose
+#     differently: the wrapper as `replay:`, its bare `claude` grandchild as
+#     `default+args:`.
+#   * the session id comes from THE SID CLIMB, not from scraping `--resume` out
+#     of argv. A session that has never been resumed carries no --resume, so a
+#     fresh pane previewed as having nothing to resume — and a fresh pane is
+#     exactly the one whose id exists nowhere else.
+#   * a claudish pane carries its REPLAY FLAGS, so it previews as
+#     `claudish … --resume`, never as the bare `claude --resume` that would
+#     replay the transcript against the real Anthropic API — wrong account,
+#     wrong model.
+#
+# The ACTIONS are the thaw's own branches, not a summary of them. cc_thaw.sh
+# writes a pending-resume file once per `sid` RECORD, so a pane with no recorded
+# session is respawned with _cc_fresh_shell in its cwd and nothing else: SHELL
+# is a real, complete outcome rather than a missing one. A secondary session is
+# recorded, counted, and deliberately never auto-resumed (MANUAL), and a session
+# id another live pane already owns is dropped at freeze time (DUP) so a wake
+# can never put two Claudes on one transcript.
+_CC_PLAN_MAX=14
+
+# The one snapshot every lookup reads: ONE tmux call and ONE ps for the whole
+# server, cached beside the inventory and invalidated with it — a preview runs
+# on every cursor move, and a process table per keystroke is not affordable.
+# Compositions memoise into plan.d/, one small file per node, written temp+mv:
+# two preview children racing on a node write identical bytes, and one killed
+# mid-write leaves a temp file, never half a command.
+_CC_PLAN_READY=0
+_cc_plan_snapshot() {
+  local inv d ps pf sf
+  [ "$_CC_PLAN_READY" = "1" ] && return 0
+  inv="$_CC_WORK/inv"; d="$_CC_WORK/plan.d"
+  ps="$_CC_WORK/plan.ps"; pf="$_CC_WORK/plan.panes"; sf="$_CC_WORK/plan.sid"
+  if [ -s "$ps" ] && [ -s "$pf" ] && [ -f "$sf" ] && [ -d "$d" ] \
+     && [ ! "$inv" -nt "$ps" ]; then
+    _CC_PLAN_READY=1
+    return 0
+  fi
+  # The inventory is rebuilt on every loop and after every action, so this
+  # follows it: a plan computed before a freeze describes a world that no
+  # longer exists.
+  rm -rf "$d" 2>/dev/null
+  mkdir -p "$d" 2>/dev/null || return 1
+  # FOUR fields, not three: cc_sidmap.awk reads f[1..3] out of its own split and
+  # ignores the rest, so the cwd rides along in the same call instead of costing
+  # a second one.
+  $TMUX_CMD list-panes -a -F \
+    "#{pane_pid}${TAB}#S:#I.#P${TAB}#{pane_id}${TAB}#{pane_current_path}" \
+    2>/dev/null > "$pf.$$"
+  mv -f "$pf.$$" "$pf" 2>/dev/null
+  ps -axo pid=,ppid=,command= 2>/dev/null > "$ps.$$"
+  mv -f "$ps.$$" "$ps" 2>/dev/null
+  # The climb LOGS the duplicate session ids it drops. This is a PREVIEW: it
+  # must not append to the freeze log every time the cursor moves over a row.
+  # The subshell is what keeps that redirect from outliving the call.
+  ( _CC_LOG_PATH=/dev/null
+    set -- "$by_pid_dir"/*.session-id
+    [ -f "$1" ] || set --
+    cc_proc_sidmap "$pf" "$ps" "$@" ) > "$sf.$$" 2>/dev/null
+  mv -f "$sf.$$" "$sf" 2>/dev/null
+  _CC_PLAN_READY=1
+  return 0
+}
+
+# One record, five fields, NONE EVER EMPTY (`-` is the floor — TAB is IFS
+# whitespace and a run of tabs collapses under `read`, the same trap the --list
+# contract documents at FR6.2/L1):
+#
+#   <action>  RESUME · SHELL · MANUAL · DUP · MISSING · UNKNOWN
+#   <sid>     the session id the action concerns, or `-`
+#   <kind>    which composition rule won (typed / replay / default+args /
+#             claudish / default), or `shell`
+#   <cwd>     where the pane is respawned
+#   <command> the exact command, LAST so a space in it can shift nothing
+_cc_plan_live() {        # <%N> — from the world as it is now
+  local pane="$1" ps pf rec pid cwd full sid cpid clpid dup typed replay \
+        launcher tagv kv
+  ps="$_CC_WORK/plan.ps"; pf="$_CC_WORK/plan.panes"
+  rec="$(awk -F'\t' -v p="$pane" '$3 == p { print $1 "\t" $4; exit }' "$pf")"
+  pid="${rec%%$TAB*}"; cwd="${rec#*$TAB}"
+  case "${pid:-}" in ''|*[!0-9]*) printf 'UNKNOWN\t-\t-\t-\t-'; return 0 ;; esac
+  # `${rec#*$TAB}` on a tabless string returns the string itself, so a row that
+  # somehow carried no cwd would report the pid as one.
+  { [ -n "$cwd" ] && [ "$cwd" != "$pid" ]; } || cwd='-'
+
+  # cc_proc_pane_cmd's rule without building a capture: the pane's depth-1 child
+  # if it has one (the `op run …` or `node …/claudish` the alias really started),
+  # else the pane process itself.
+  full="$(awk -v root="$pid" '
+    { line = $0; sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, "", line)
+      if ($1 == root && own == "")   own = line
+      if ($2 == root && child == "") child = line }
+    END { print (child != "" ? child : own) }' "$ps")"
+
+  sid=""; cpid=""; clpid="-"; dup=""
+  rec="$(awk -F'\t' -v p=";PANEID=$pane" '$2 == p { print; exit }' "$_CC_WORK/plan.sid")"
+  if [ -n "$rec" ]; then
+    # Assign only when the tag is PRESENT: `x="$(f)" || x=""` would clear a dup,
+    # and a lost dup reads as a clean resume for an id another pane still owns.
+    tagv="$(_cc_tag "$rec" ';DUP=')" && dup="$tagv"
+    sid="$(_cc_tag "$rec" ';SID=')" || sid=""
+    cpid="$(_cc_tag "$rec" ';PID=')" || cpid=""
+    clpid="$(_cc_tag "$rec" ';CLPID=')" || clpid="-"
+  fi
+
+  typed="$(_cc_live_typed_b64 "$pane" 2>/dev/null)" || typed=""
+
+  replay=""
+  if [ -n "$clpid" ] && [ "$clpid" != "-" ]; then
+    launcher="$(awk -v p="$clpid" '$1 == p {
+      line = $0; sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, "", line); print line; exit }' "$ps")"
+    [ -n "$launcher" ] && replay="$(_cc_claudish_replay "$launcher" "$cpid")"
+  fi
+
+  if [ -z "$sid" ]; then
+    if [ -n "$dup" ]; then
+      printf 'DUP\t%s\tshell\t%s\t%s' "$dup" "$cwd" "$(_cc_fresh_shell)"
+    else
+      printf 'SHELL\t-\tshell\t%s\t%s' "$cwd" "$(_cc_fresh_shell)"
+    fi
+    return 0
+  fi
+  kv="$(_cc_restore_cmd_kv "$full" "$typed" "$sid" "$replay")"
+  printf 'RESUME\t%s\t%s\t%s\t%s' "$sid" "${kv%%$TAB*}" "$cwd" "${kv#*$TAB}"
+}
+
+_cc_plan_stored() {      # <key> — from the record the freeze wrote
+  local key="$1" state l r pcmd ptyped psid preplay ssid cwd kv havepane
+  state="$(cc_store_path "$key")"
+  [ -f "$state" ] || { printf 'MISSING\t-\t-\t-\t-'; return 0; }
+  cwd="$(_cc_unb64 "$(cc_store_scalar "$state" primary_cwd)")"
+  [ -n "$cwd" ] || cwd='-'
+  pcmd=''; ptyped=''; psid=''; preplay=''; ssid=''; havepane=0
+  while IFS= read -r l; do
+    case "$l" in
+      'pane	'*)
+        [ "$havepane" = "1" ] && continue
+        havepane=1
+        pcmd="$(_cc_unb64 "$(_cc_tag "$l" ';CMD=')" 2>/dev/null)"
+        ptyped="$(_cc_tag "$l" ';TYPED=')" || ptyped='' ;;
+      'sid	'*)
+        r="$(_cc_tag "$l" ';ROLE=')" || r='primary'
+        if [ "$r" = "primary" ]; then
+          [ -n "$psid" ] && continue
+          psid="$(_cc_tag "$l" ';CLAUDE_SID=')" || psid=''
+          # ;REPLAY=, base64 — the STORE's tag. `;CLAUDISH_REPLAY=` is the
+          # resurrect SNAPSHOT's name for the same fact, and reading it here
+          # found nothing, so every frozen claudish pane previewed as the bare
+          # `claude --resume` its thaw is written to never run.
+          preplay="$(_cc_tag_b64 "$l" ';REPLAY=')" || preplay=''
+        else
+          [ -n "$ssid" ] && continue
+          ssid="$(_cc_tag "$l" ';CLAUDE_SID=')" || ssid=''
+        fi ;;
+    esac
+  done < "$state"
+
+  if [ -n "$psid" ]; then
+    kv="$(_cc_restore_cmd_kv "$pcmd" "$ptyped" "$psid" "$preplay")"
+    printf 'RESUME\t%s\t%s\t%s\t%s' "$psid" "${kv%%$TAB*}" "$cwd" "${kv#*$TAB}"
+  elif [ -n "$ssid" ]; then
+    printf 'MANUAL\t%s\tshell\t%s\t%s' "$ssid" "$cwd" "$(_cc_fresh_shell)"
+  else
+    printf 'SHELL\t-\tshell\t%s\t%s' "$cwd" "$(_cc_fresh_shell)"
+  fi
+}
+
+# The record for one node, memoised. A frozen pane has BOTH a live tombstone and
+# a key: the STATE FILE wins, because it is the record a wake will actually read
+# and the tombstone's own process is a banner.
+_cc_plan_for() {         # <node> <key>
+  local node="$1" key="${2:--}" f rec
+  _cc_plan_snapshot || { printf 'UNKNOWN\t-\t-\t-\t-'; return 0; }
+  f="$_CC_WORK/plan.d/${node//[^A-Za-z0-9_-]/_}"
+  if [ -s "$f" ]; then IFS= read -r rec < "$f"; printf '%s' "$rec"; return 0; fi
+  if [ -n "$key" ] && [ "$key" != "-" ]; then rec="$(_cc_plan_stored "$key")"
+  else                                        rec="$(_cc_plan_live "$node")"
+  fi
+  { printf '%s\n' "$rec" > "$f.$$" 2>/dev/null && mv -f "$f.$$" "$f" 2>/dev/null; } || :
+  printf '%s' "$rec"
+}
+
+# Field <n> of a record, 1-based. Parameter expansion rather than `cut`, and
+# never `read -r a b c d e`: IFS=TAB COLLAPSES a run of tabs, so a reader that
+# split on it would silently shift every field after an empty one — the L1 trap
+# this whole file is written around. The record has no empty fields, and this
+# does not rely on that either.
+_cc_plan_field() { # <record> <n>
+  local rec="$1" i=1
+  while [ "$i" -lt "$2" ]; do
+    case "$rec" in *"$TAB"*) rec="${rec#*$TAB}" ;; *) printf '%s' '-'; return 0 ;; esac
+    i=$((i + 1))
+  done
+  printf '%s' "${rec%%$TAB*}"
 }
 
 # Render the restore block. Wrapped at the preview width so a long `op run …`
@@ -1105,12 +1294,146 @@ _cc_restore_block() {    # <kind> <cmd> <trailing note...>
   return 0
 }
 
+# A cwd, shortened to fit — from the LEFT, which is the opposite of every other
+# cell in this file and the only correct direction for a path. `/Users/jack/mag/
+# magai/aniflow/.claude/worktrees/mastra` and its sibling worktree differ in the
+# last component and nowhere else, so a right-hand ellipsis renders them
+# identical. $HOME collapses to `~` first, which is 11 characters back on this
+# machine and needs no ellipsis at all.
+_cc_short_path() { # <var> <path> <width>
+  local p="$2" w="$3"
+  case "$p" in "$HOME"/*) p="~${p#$HOME}" ;; "$HOME") p='~' ;; esac
+  [ "$w" -lt 8 ] && w=8
+  [ "${#p}" -gt "$w" ] && p="$_CC_G_ELL${p:$((${#p} - w + 1))}"
+  printf -v "$1" '%s' "$p"
+}
+
+# ONE pane of a plan: who it is, what it comes back as, and the command itself.
+#
+# THE COMMAND IS NEVER TRUNCATED. Every other cell here is padded and
+# ellipsised, because a name that does not fit is still recognisable at half
+# length; a command that does not fit is a command you cannot run. So the
+# identity line is a table row and the command below it FOLDS — this block
+# exists to be read and copied, and clipping it at the right edge is the one
+# failure the feature cannot afford.
+#
+# Colour carries no fact on its own (this popup is used on a light terminal
+# where grey is the first thing to disappear): the action is spelled out in the
+# badge, and the hue only repeats it.
+_cc_plan_row() {   # <width> <node> <state> <rss> <label> <record>
+  local w="$1" node="$2" st="$3" rss="$4" label="$5" rec="$6" \
+        action sid kind kshort cwd cmd col glyph mem nodec labc badge lw note
+  action="${rec%%$TAB*}"; rec="${rec#*$TAB}"
+  sid="${rec%%$TAB*}";    rec="${rec#*$TAB}"
+  kind="${rec%%$TAB*}";   rec="${rec#*$TAB}"
+  cwd="${rec%%$TAB*}";    cmd="${rec#*$TAB}"
+  # The kind carries its evidence after the colon (`default+args:--flag …`), and
+  # only the rule name is shown — so only the rule name may be budgeted for, or
+  # a long argument list silently squeezes the cwd down to its floor.
+  kshort="${kind%%:*}"
+
+  case "$action" in
+    RESUME)  col="$_CC_C_OK";   badge='RESUME' ;;
+    SHELL)   col="$_CC_C_DIM";  badge='shell' ;;
+    MANUAL)  col="$_CC_C_PART"; badge='MANUAL' ;;
+    DUP)     col="$_CC_C_PART"; badge='DUP' ;;
+    MISSING) col="$_CC_C_ORPH"; badge='NO STATE' ;;
+    *)       col="$_CC_C_DIM";  badge='?' ;;
+  esac
+  # Present tense or future tense, in one character: ❄ means this command runs
+  # on the next wake, blank means it is what a freeze of a running pane would
+  # put back.
+  case "$st" in AWAKE) glyph=' ' ;; *) glyph="$_CC_G_SNOW" ;; esac
+  _cc_size_cell mem "$rss"
+
+  #   ❄ %31  ✳ deploy magento2            ~1.5G    RESUME
+  #        c --dangerously-skip-permissions --resume 4f21b8c0-…
+  #        in ~/mag/hn  ·  typed
+  lw=$((w - 27))
+  [ "$lw" -lt 10 ] && lw=10
+  _cc_rpad nodec "$node" 5
+  _cc_rpad labc "$label" "$lw"
+  _cc_lpad mem "$mem" 7
+  _cc_lpad badge "$badge" 9
+  printf '  %s %s%s%s %s%s%s%s%s%s\n' \
+    "$glyph" "$_CC_C_DIM" "$nodec" "$_CC_C_OFF" "$labc" \
+    "$_CC_C_DIM" "$mem" "$_CC_C_OFF" "$col$badge" "$_CC_C_OFF"
+
+  case "$action" in
+    SHELL|DUP|MANUAL) ;;
+    *) printf '%s\n' "$cmd" | fold -s -w $((w - 9)) | sed 's/^/       /' ;;
+  esac
+
+  case "$action" in
+    RESUME)  _cc_short_path cwd "$cwd" $((w - 22 - ${#kshort}))
+             note="in ${cwd}  ${_CC_G_DOT}  ${kshort}" ;;
+    SHELL)   _cc_short_path cwd "$cwd" $((w - 35))
+             note="no session — respawns in ${cwd}" ;;
+    MANUAL)  note="secondary, never auto-resumed: claude --resume $sid" ;;
+    DUP)     note="${sid} — id is live elsewhere, comes back without --resume" ;;
+    MISSING) note="state file gone; the ids are in the freeze log, grep the key" ;;
+    *)       note="this pane is not on this server any more" ;;
+  esac
+  printf '       %s%s%s\n' "$_CC_C_DIM" "$note" "$_CC_C_OFF"
+  return 0
+}
+
+# Every pane under a container, in tree order, each with its own plan. Panes are
+# collected from the INVENTORY rather than re-listed, so the block can never
+# disagree with the row the cursor is on: a session's panes are its windows'
+# children, and rows arrive depth-first, so one pass fills the window set before
+# the first pane that needs it.
+_cc_plan_block() { # <inventory> <node>
+  local inv="$1" node="$2" w rows body hdr n shown shellcmd node2 key st rss label rec
+  w="${FZF_PREVIEW_COLUMNS:-${COLUMNS:-58}}"
+  case "$w" in ''|*[!0-9]*) w=58 ;; esac
+  [ "$w" -lt 40 ] && w=40
+  [ -s "$inv" ] || return 0
+  rows="$_CC_WORK/planrows.$$"; body="$_CC_WORK/planbody.$$"
+  awk -F'\t' -v n="$node" '
+    $11 == "window" && $12 == n { W[$13] = 1 }
+    $11 == "pane" && ($12 == n || ($12 in W)) {
+      print $13 "\t" $9 "\t" $1 "\t" $6 "\t" $18 }
+  ' "$inv" > "$rows"
+  [ -s "$rows" ] || { rm -f "$rows" 2>/dev/null; return 0; }
+
+  n=0; shown=0; shellcmd=''
+  : > "$body"
+  while IFS="$TAB" read -r node2 key st rss label; do
+    [ -n "${node2:-}" ] || continue
+    n=$((n + 1))
+    [ "$shown" -ge "$_CC_PLAN_MAX" ] && continue
+    rec="$(_cc_plan_for "$node2" "$key")"
+    # The respawn command is identical for every session-less pane, so it is
+    # stated ONCE under the block instead of repeated down it — the per-row line
+    # then carries the one thing that differs, which is the cwd.
+    case "$rec" in SHELL*) [ -n "$shellcmd" ] || shellcmd="$(_cc_plan_field "$rec" 5)" ;; esac
+    _cc_plan_row "$w" "$node2" "$st" "$rss" "$label" "$rec" >> "$body"
+    shown=$((shown + 1))
+  done < "$rows"
+
+  # The title left, the count hard against the rule's right end — the same
+  # left-name / right-figure shape the tree's own rows have, so the two blocks
+  # read as one table rather than two.
+  _cc_lpad hdr "$n pane$([ "$n" = 1 ] || printf 's')" $((w - 4 - 12))
+  printf '\n  %sRESTORE PLAN%s%s%s%s\n' \
+    "$_CC_C_BOLD" "$_CC_C_OFF" "$_CC_C_DIM" "$hdr" "$_CC_C_OFF"
+  printf '  %s\n' "$(_cc_rule $((w - 4)))"
+  cat "$body"
+  [ -n "$shellcmd" ] && printf '  %sa pane with no session comes back as:  %s%s\n' \
+    "$_CC_C_DIM" "$shellcmd" "$_CC_C_OFF"
+  # A cap that is not stated reads as "that was all of them".
+  [ "$n" -gt "$shown" ] && printf '  %s%s more pane%s not shown — open a window row for those%s\n' \
+    "$_CC_C_DIM" "$((n - shown))" "$([ "$((n - shown))" = 1 ] || printf 's')" "$_CC_C_OFF"
+  rm -f "$rows" "$body" 2>/dev/null
+  return 0
+}
+
 # ── The fzf preview ──────────────────────────────────────────────────────────
 # For a stored pane the state file is the truth; for a live one, the screen. A
 # container previews its children, because that is what its actions will touch.
 _cc_preview() {
-  local line node lev st key target inv state l sid role cls n \
-        pcmd ptyped preplay psid kv lcmd ltyped lsid
+  local line node lev st key target inv state l sid role cls n rec
   line="${1:-}"
   node="$(printf '%s' "$line" | cut -f2)"
   lev="$(printf '%s' "$line" | cut -f3)"
@@ -1121,22 +1444,34 @@ _cc_preview() {
 
   case "$lev" in
     session|window)
-      printf '  %s   %s\n\n' "$st" "$([ "$lev" = session ] && printf '%s' "${target%:*}" || printf '%s' "$target")"
+      # The same three-part shape as a pane preview — title, rule, facts — so
+      # the eye lands in the same place whichever row the cursor is on.
+      printf '  %s%s%s  %s%s%s\n' "$_CC_C_BOLD" "$st" "$_CC_C_OFF" "$_CC_C_BOLD" \
+        "$([ "$lev" = session ] && printf '%s' "${target%:*}" || printf '%s' "$target")" "$_CC_C_OFF"
+      printf '  %s%s%s\n\n' "$_CC_C_DIM" "$(_cc_rule "$(( ${FZF_PREVIEW_COLUMNS:-58} - 4 ))")" "$_CC_C_OFF"
       if [ -s "$inv" ]; then
-        awk -F'\t' -v n="$node" -v lev="$lev" '
-          function h(b) {
-            if (b >= 1073741824) return sprintf("~%.1fG", b / 1073741824)
-            if (b >= 1048576)    return sprintf("~%.0fM", b / 1048576)
-            return sprintf("~%dK", b / 1024)
-          }
-          # Fixed-width columns first, free text LAST: awk pads by BYTES, so a
-          # UTF-8 pane title in the middle would shear every column after it.
-          $12 == n {
-            if ($11 == "window") printf "    %-4s %2sp %8s  %-8s  %s\n", $3, $7, h($6), $1, $18
-            else                 printf "    %-5s %-9.9s %8s  %-8s  %s\n", $13, $15, h($6), $1, $18
-          }
-        ' "$inv"
-        printf '\n'
+        # A SESSION lists its windows: one level down is a summary, and the
+        # panes themselves are enumerated by the restore plan below. A WINDOW
+        # does not list its panes here — the plan lists exactly those panes,
+        # with the command each comes back as, and printing them twice says
+        # nothing the second time.
+        if [ "$lev" = "session" ]; then
+          printf '    %s%-4s %3s %8s  %-8s  %s%s\n' "$_CC_C_DIM" \
+            'WIN' '#P' 'MEMORY' 'STATE' 'NAME' "$_CC_C_OFF"
+          awk -F'\t' -v n="$node" '
+            function h(b) {
+              if (b >= 1073741824) return sprintf("~%.1fG", b / 1073741824)
+              if (b >= 1048576)    return sprintf("~%.0fM", b / 1048576)
+              return sprintf("~%dK", b / 1024)
+            }
+            # Fixed-width columns first, free text LAST: awk pads by BYTES, so a
+            # UTF-8 window name in the middle would shear every column after it.
+            $12 == n && $11 == "window" {
+              printf "    %-4s %2sp %8s  %-8s  %s\n", $3, $7, h($6), $1, $18
+            }
+          ' "$inv"
+          printf '\n'
+        fi
         awk -F'\t' -v n="$node" '
           $13 == n {
             printf "  panes  %s   frozen  %s   session ids  %s\n", $7, $14, $8
@@ -1144,9 +1479,17 @@ _cc_preview() {
           }
         ' "$inv"
       fi
-      printf '\n  Freezing this row freezes every pane beneath it, one pane at a\n'
+
+      # What C-F and C-W will actually do, pane by pane. This is the block the
+      # row exists to justify: the counts above say how much is at stake, and
+      # this says what each pane comes back as.
+      _cc_plan_block "$inv" "$node"
+
+      printf '\n  %sFreezing this row freezes every pane beneath it, one pane at a\n' "$_CC_C_DIM"
       printf '  time; a pane that fails a rail is REFUSED and left running, and\n'
-      printf '  the rest still freeze. Memory figures are approximate.\n'
+      printf '  the rest still freeze. %s marks a pane that is already frozen, so\n' "$_CC_G_SNOW"
+      printf '  its command runs on the next wake; a row without one shows what a\n'
+      printf '  freeze would put back. Memory figures are approximate.%s\n' "$_CC_C_OFF"
       return 0 ;;
   esac
 
@@ -1192,26 +1535,9 @@ _cc_preview() {
       # The command a thaw of THIS entry will run. Composed from the record the
       # freeze wrote — the typed capture if there was one, else the process the
       # freeze saw — so it survives the pane's disappearance.
-      pcmd=''; ptyped=''; preplay=''; psid=''
-      while IFS= read -r l; do
-        case "$l" in
-          'pane	'*)
-            pcmd="$(_cc_unb64 "$(_cc_tag "$l" ';CMD=')" 2>/dev/null)"
-            ptyped="$(_cc_tag "$l" ';TYPED=')" || ptyped=''
-            ;;
-          'sid	'*)
-            [ -n "$psid" ] && continue
-            case "$l" in *';ROLE=primary'*|*';ROLE='*) ;; esac
-            psid="$(_cc_tag "$l" ';CLAUDE_SID=')" || psid=''
-            preplay="$(_cc_tag "$l" ';CLAUDISH_REPLAY=')" || preplay=''
-            ;;
-        esac
-      done < "$state"
-      if [ -n "$psid" ] || [ -n "$pcmd" ]; then
-        kv="$(_cc_restore_cmd_kv "$pcmd" "$ptyped" "$psid" "$preplay")"
-        _cc_restore_block "${kv%%	*}" "${kv#*	}" \
-          'runs on thaw (C-W), in the pane it was frozen from'
-      fi
+      rec="$(_cc_plan_for "$node" "$key")"
+      _cc_restore_block "$(_cc_plan_field "$rec" 3)" "$(_cc_plan_field "$rec" 5)" \
+        "runs on wake (C-W), in $(_cc_plan_field "$rec" 4)"
 
       printf '\n  %sSecondary sessions are listed but never auto-resumed by a\n' "$_CC_C_DIM"
       printf '  thaw. Resume one by hand: claude --resume <uuid>%s\n' "$_CC_C_OFF"
@@ -1236,18 +1562,24 @@ _cc_preview() {
   # The restore command for a pane that is still RUNNING. Shown deliberately:
   # the useful moment to check what a freeze would put back is BEFORE freezing,
   # not after, when the pane is gone and the answer can no longer be compared
-  # against reality. Inputs are the ones its own freeze would capture.
-  lcmd="$(_cc_live_full_cmd "$node" 2>/dev/null)" || lcmd=''
-  ltyped="$(_cc_live_typed_b64 "$node" 2>/dev/null)" || ltyped=''
-  lsid=''
-  case "$lcmd" in
-    *--resume\ *) lsid="${lcmd#*--resume }"; lsid="${lsid%% *}" ;;
+  # against reality. Inputs are the ones its own freeze would capture — the sid
+  # from the climb, the launcher from depth 1, the claudish replay flags — so
+  # this is the command, not a likeness of it.
+  rec="$(_cc_plan_for "$node" '-')"
+  case "$(_cc_plan_field "$rec" 1)" in
+    RESUME)
+      _cc_restore_block "$(_cc_plan_field "$rec" 3)" "$(_cc_plan_field "$rec" 5)" \
+        'what a freeze of this pane would put back' ;;
+    SHELL)
+      printf '\n  %sNo Claude session here. A freeze of this pane records its cwd\n' "$_CC_C_DIM"
+      printf '  and title only, and a wake respawns it as:  %s%s\n' \
+        "$(_cc_plan_field "$rec" 5)" "$_CC_C_OFF" ;;
+    DUP)
+      printf '\n  %sThe session id here is already owned by another live pane\n' "$_CC_C_PART"
+      printf '  (%s). A freeze records NO id for this pane, so a wake\n' "$(_cc_plan_field "$rec" 2)"
+      printf '  brings it back without --resume rather than putting two\n'
+      printf '  Claudes on one transcript.%s\n' "$_CC_C_OFF" ;;
   esac
-  if [ -n "$ltyped" ] || [ -n "$lsid" ]; then
-    kv="$(_cc_restore_cmd_kv "$lcmd" "$ltyped" "$lsid" '')"
-    _cc_restore_block "${kv%%	*}" "${kv#*	}" \
-      'what a freeze of this pane would put back'
-  fi
 
   printf '\n  %s── last 50 lines of this pane ───────────────────────%s\n' "$_CC_C_DIM" "$_CC_C_OFF"
   $TMUX_CMD capture-pane -p -S -50 -t "$node" 2>/dev/null | sed 's/^/  /'

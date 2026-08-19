@@ -115,6 +115,15 @@ if [ "$#" -lt 9 ]; then
 fi
 w1="$1"; w2="$2"; w3="$3"; w4="$4"; w5="$5"; w6="$6"; w7="$7"; w8="$8"; w9="$9"
 
+assert_equals() {
+  if [ "$2" = "$3" ]; then
+    echo "  PASS: $1"; pass=$((pass+1))
+  else
+    echo "  FAIL: $1"; echo "    expected exactly: [$3]"; echo "    got:              [$2]"
+    fail=$((fail+1))
+  fi
+}
+
 _pane_of() { _tmux list-panes -t "work:$1" -F '#{pane_id}' | head -1; }
 p1="$(_pane_of "$w1")"; p2="$(_pane_of "$w2")"
 p3="$(_pane_of "$w3")"; p4="$(_pane_of "$w4")"
@@ -140,13 +149,17 @@ cwd="$(_tmux list-panes -t "$p1" -F '#{pane_current_path}')"
 # live directory: helpers.sh defaults there whenever the option is unset.
 _tmux set-option -g @resurrect-dir "$RD"
 cc_guard_resurrect_dir "$RD" tmux -L "$SOCKET" -f /dev/null
-_tmux set-option -g @claude-continuity-claude-cmd "echo"
 _tmux set-option -g @claude-continuity-pending-dir "$QD"
 _tmux set-option -g @claude-continuity-log-file "$LOG"
 
 # ── Snapshot: one row per launcher shape ─────────────────────────────────────
 # Columns: pane session win win_active :win_flags pane_idx title :dir
 #          pane_active cmd :full_command ;CLAUDE_SID=…
+_row_cmd() { # <win> <title> <cmd> <full_cmd> <sid> <cmd_b64>
+  printf 'pane\twork\t%s\t0\t:-\t1\t%s\t:%s\t0\t%s\t:%s\t;CLAUDE_SID=%s\t;CLAUDE_CMD=%s\n' \
+    "$1" "$2" "$cwd" "$3" "$4" "$5" "$6"
+}
+
 _row() { # <win> <title> <cmd> <full_cmd> <sid>
   printf 'pane\twork\t%s\t0\t:-\t1\t%s\t:%s\t0\t%s\t:%s\t;CLAUDE_SID=%s\n' \
     "$1" "$2" "$cwd" "$3" "$4" "$5"
@@ -242,11 +255,16 @@ assert_contains     "op resume set to SID"             "$f2" "--resume sid-OP"
 assert_not_contains "op stale resume dropped"          "$f2" "sid-STALE2"
 
 # ── 3. plain claude: configured command wins, snapshot cmd NOT replayed ──────
-assert_contains     "plain claude uses configured cmd" "$f3" "echo --resume sid-PLAIN"
-assert_not_contains "plain claude not replayed"        "$f3" "/tmp/ccwr-fake/claude"
+# A plain claude row is now REPLAYED like any other: it comes back as what it
+# was, not rebuilt onto a launcher declared in tmux.conf.
+assert_contains     "plain claude is replayed as itself" "$f3" "/tmp/ccwr-fake/claude --resume sid-PLAIN"
 
 # ── 4. MCP child: never executed, falls back to configured command ───────────
-assert_contains     "mcp row uses configured cmd"      "$f4" "echo --resume sid-MCP"
+# The ps capture recorded the pane's MCP CHILD instead of claude, so there is
+# nothing safe to replay — but the row carries a CLAUDE_SID, which proves it WAS
+# a Claude pane. It comes back as bare `claude`: the program we know, not a
+# launcher preference pasted over it from tmux.conf.
+assert_equals       "mcp row falls back to bare claude"        "$f4" "claude --resume sid-MCP"
 assert_not_contains "mcp child command not queued"     "$f4" "mcp-server.js"
 
 # ── 5. Doubled --resume: exactly one resume flag, carrying the SID ───────────
@@ -262,11 +280,13 @@ else
 fi
 
 # ── 6. claudish --mcp: same binary as case 1, must NOT be replayed ───────────
-assert_contains     "claudish --mcp uses configured cmd" "$f6" "echo --resume sid-CLMCP"
+assert_equals       "claudish --mcp row falls back to bare claude" "$f6" "claude --resume sid-CLMCP"
 assert_not_contains "claudish --mcp not queued"          "$f6" "--mcp"
 
 # ── 7. Shell metacharacters: never queued into the eval'd pending file ───────
-assert_contains     "injection row uses configured cmd" "$f7" "echo --resume sid-INJECT"
+# The injection payload must never reach the eval. The SID still resumes.
+assert_equals       "injection row falls back to bare claude"  "$f7" "claude --resume sid-INJECT"
+assert_not_contains "injection payload never queued"           "$f7" "touch"
 assert_not_contains "injection payload not queued"      "$f7" "touch"
 assert_not_contains "injection separator not queued"    "$f7" ";"
 
@@ -418,14 +438,13 @@ echo ""
 # post_restore used to rewrite a bare alias into the absolute path of the claude
 # binary (`c` -> /Users/you/.local/bin/claude), which silently dropped every flag
 # and env wrapper the alias carried. Whatever is configured must survive as-is.
-_tmux set-option -g @claude-continuity-claude-cmd "c"
-_row "$w3" "plain-pane" "claude" "/tmp/ccwr-fake/claude --resume sid-STALE3" "sid-ALIAS" > "$RF"
+_row_cmd "$w3" "plain-pane" "claude" "/tmp/ccwr-fake/claude --resume sid-STALE3" "sid-ALIAS" "$(printf %s "c" | base64 | tr -d "\n")" > "$RF"
 TMUX_CMD="tmux -L $SOCKET" RESURRECT_FILE="$RF" bash "$RESTORE_SCRIPT" >/dev/null 2>&1
 f8="$(cat "$QD/${p3#%}" 2>/dev/null)"
 echo ""
 printf 'Alias phase: %s -> %s\n' "$p3" "$f8"
 if [ "$f8" = "c --resume sid-ALIAS" ]; then
-  echo "  PASS: alias queued verbatim ('c', not a resolved path)"
+  echo "  PASS: the recorded alias is queued verbatim ('c', not a resolved path)"
   ((pass++))
 else
   echo "  FAIL: expected exactly 'c --resume sid-ALIAS', got: $f8"
@@ -433,7 +452,6 @@ else
 fi
 assert_not_contains "alias not path-resolved"          "$f8" "/claude"
 assert_not_contains "alias not expanded to its RHS"    "$f8" "--dangerously"
-_tmux set-option -g @claude-continuity-claude-cmd "echo"
 echo ""
 
 # ── 5. pre_restore purges pending resumes from an earlier restore ────────────

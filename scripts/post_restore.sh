@@ -95,8 +95,6 @@ panes_dir="${panes_dir:-$HOME/.config/tmux-claude/panes}"
 pending_dir="$($TMUX_CMD show-option -gqv @claude-continuity-pending-dir 2>/dev/null)"
 pending_dir="${pending_dir:-$HOME/.config/tmux-claude/pending}"
 
-claude_cmd="$($TMUX_CMD show-option -gqv @claude-continuity-claude-cmd 2>/dev/null)"
-claude_cmd="${claude_cmd:-claude}"
 
 # Base command for restoring CLAUDISH panes. Defaults to bare `claudish` — how the
 # user launches it by hand. The precmd runs `eval "<cmd>"` (no exec, see
@@ -113,41 +111,9 @@ claudish_cmd="${claudish_cmd:-claudish}"
 # Empty by default — nothing extra is restored.
 restore_procs="$($TMUX_CMD show-option -gqv @claude-continuity-restore-procs 2>/dev/null)"
 
-# The configured command is used EXACTLY as written. No path resolution, no
-# alias expansion, no rewriting: what you would type is what a restored pane runs.
-#
-# This script used to resolve `c` into `/Users/you/.local/bin/claude` before
-# queueing it, because the precmd hook ran the pending command as
-# `eval "exec <cmd> …"` and zsh does not expand aliases on the word after the
-# `exec` keyword. The hook dropped `exec` when it switched to launching claude as
-# a CHILD of the shell (so quitting claude leaves you at a prompt instead of
-# killing the pane), and alias expansion inside a plain `eval` works fine —
-# `eval` re-parses its argument at runtime, which is when aliases expand.
-# Verified on zsh 5.9:
-#   alias c="echo A"; f() { eval "c hi"; };      f  ->  A hi
-#   alias c="echo A"; f() { eval "exec c hi"; }; f  ->  command not found: c
-#
-# So the resolution outlived its reason, and it was not harmless: it rewrote the
-# user's own launcher into a bare binary path, dropping every flag and env
-# wrapper the alias carried. A pane relaunched as `/Users/…/.local/bin/claude`
-# is not the same program as one launched with `c`.
-#
-# Set @claude-continuity-claude-cmd to whatever you actually type: an alias (`c`),
-# a shell function, a bare binary (`claude`, the default), or a full command line.
-
-# Whole-token match of the configured command against a captured command line.
-# Used only to qualify rows in legacy snapshots that carry no CLAUDE_SID. Padded
-# on both sides so a one-character alias like `c` matches a pane recorded as `c`
-# without also matching every path that happens to contain the letter.
-_cc_matches_configured_cmd() {
-  case "$claude_cmd" in
-    ''|*' '*) return 1 ;;   # empty, or a full command line — never token-matches
-  esac
-  case " $1 " in
-    *" ${claude_cmd} "*|*"/${claude_cmd} "*) return 0 ;;
-  esac
-  return 1
-}
+# @claude-continuity-claude-cmd is gone. A pane comes back as what it WAS —
+# its own recording, or its own captured command — so there is no configured
+# launcher to rebuild onto and nothing to token-match legacy rows against.
 
 # ── Relaunch command selection ───────────────────────────────────────────────
 # A restored pane must come back as the SAME program it was running. Rebuilding
@@ -224,7 +190,6 @@ for sidecar in "${panes_dir}"/*.session-id; do
   esac
 done
 
-base_cmd="$claude_cmd"
 _cc_written=0
 _cc_considered=0        # rows that PASSED the Claude/restore-proc filter — the only
                         # population the numerator and the skip counters are drawn
@@ -233,6 +198,7 @@ _cc_proc_written=0     # non-Claude programs (@claude-continuity-restore-procs) 
 _cc_skipped_absent=0    # SID rows whose session no longer exists live (benign)
 _cc_skipped_present=0   # SID rows whose session IS live but didn't resolve (real miss)
 _cc_skipped_busy=0      # rows whose pane is already running something (manual restore)
+_cc_skipped_unknown=0   # rows with no recording and no usable captured command
 _cc_frozen_claimed=0    # ❄ tombstone rows re-claimed onto their live pane
                         # (onto the window, for a legacy window-unit entry)
 _cc_frozen_warn=0       # frozen anomalies that warrant a boot warning, not a failure
@@ -555,7 +521,6 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   # ps-based capture often records a Claude pane's MCP-server child (tmux-mcp,
   # railway mcp, mnemex --mcp, mcp-server.py) instead of claude — which silently
   # dropped 20 of 32 enriched sessions (proven: boot verdict 12/32).
-  # The configured-command test is whole-token (see _cc_matches_configured_cmd):
   # a substring test would qualify nearly every pane once the configured command
   # is a short alias like `c`.
   # Does this row's command match a configured extra program (codex, lazygit, …)?
@@ -569,8 +534,17 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
     done
   fi
 
-  if [ -z "$resume_token" ] && [ -z "$restore_proc_cmd" ] \
-     && [[ "$full_cmd" != *"claude"* ]] && ! _cc_matches_configured_cmd "$full_cmd"; then
+  # A row carrying a RECORDING is restorable whatever it is running. pre_save
+  # attaches one only to a pane that had a live recording at save time, and the
+  # shell clears that recording the moment the command finishes — so the presence
+  # of ;CLAUDE_CMD= already means "this pane was running something". A dev
+  # server, htop, psql and Claude all qualify on the same terms, and a completed
+  # one-shot never reaches here because its recording was cleared before the save.
+  #
+  # This is what makes @claude-continuity-restore-procs' allowlist redundant:
+  # nothing has to be named in advance.
+  if [ -z "$resume_token" ] && [ -z "$restore_proc_cmd" ] && [ -z "$typed_cmd_b64" ] \
+     && [[ "$full_cmd" != *"claude"* ]]; then
     continue
   fi
 
@@ -704,8 +678,22 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
     _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') proc=[$restore_proc_cmd]"
     _cc_proc_written=$((_cc_proc_written + 1))
   else
-    { cc_compose_relaunch "$base_cmd" "$claudish_cmd" "$typed_cmd_b64" "$full_cmd" \
-        "$claudish_replay" "$resume_token"; printf '\n'; } > "$pane_key_file"
+    _relaunch_cmd="$(cc_compose_relaunch "$claudish_cmd" "$typed_cmd_b64" "$full_cmd" \
+        "$claudish_replay" "$resume_token")"
+
+    # Nothing identifiable to bring back. With the configured-launcher default
+    # gone there is no longer anything to fall back ONTO, so a row with no
+    # recording and no captured command we are willing to execute is skipped
+    # rather than guessed at. This is the population resurrect's ps capture
+    # mangles — an MCP child recorded in place of claude, or text the eval
+    # whitelist rejects. Writing an empty pending file here would leave the pane
+    # to `eval ""` and count as a successful resume in the verdict.
+    if [ -z "$_relaunch_cmd" ]; then
+      _cc_log "SKIP  $pane_target -> $pane_id ($match_kind, '$pane_title') nothing to replay (no recording, no usable command)"
+      _cc_skipped_unknown=$((_cc_skipped_unknown + 1))
+      continue
+    fi
+    printf '%s\n' "$_relaunch_cmd" > "$pane_key_file"
     if [ -n "$claudish_replay" ] && [ -n "$resume_token" ]; then
       _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') claudish resume=$resume_token [$claudish_replay]"
     elif [ -n "$resume_token" ]; then

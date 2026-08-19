@@ -945,6 +945,17 @@ else
   rm -f "$stripped"
 fi
 
+# pane_target -> pane_id, for every LIVE pane.
+#
+# The declare map above covers only panes in the Claude registry, because that
+# is what the process walk looks for. Every other pane — a dev server, htop,
+# psql — has a recording too now (the preexec hook records unconditionally, and
+# a precmd clears it the moment the command finishes), and needs its pane id to
+# find it. One tmux call, not one per row.
+_pane_id_map="${SNAPSHOT_FILE}.panemap.$$"
+$TMUX_CMD list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}	#{pane_id}' \
+  2>/dev/null > "$_pane_id_map" || : > "$_pane_id_map"
+
 tmp="${SNAPSHOT_FILE}.enrich.$$"
 
 while IFS=$'\t' read -r line_type rest; do
@@ -990,13 +1001,36 @@ EOF
     [ -n "$matched_cmd" ]    && _row="${_row}	;CLAUDE_CMD=${matched_cmd}"
     [ -n "$matched_replay" ] && _row="${_row}	;CLAUDISH_REPLAY=${matched_replay}"
     printf '%s\n' "$_row"
-  else
-    printf '%s\t%s\n' "$line_type" "$rest"
+    continue
   fi
+
+  # Not a Claude pane — but it may still be running something worth bringing
+  # back. Attach its recording if one exists.
+  #
+  # The recording's PRESENCE is the whole test. preexec writes it and a precmd
+  # removes it the moment the shell is back at a prompt, so a file exists only
+  # while a command is actually running. A pane sitting at a prompt has none, and
+  # a `terraform apply` that finished had its recording cleared before this save
+  # could see it — so nothing here can resurrect a completed one-shot. No
+  # allowlist, no name matching: if it is still running, it comes back.
+  #
+  # -s, not -f: the fallback clear path truncates instead of unlinking on a zsh
+  # without the zsh/files module, and an empty recording means "nothing running".
+  _pane_id=""
+  _pane_id="$(awk -F'\t' -v t="$pane_target" '$1 == t { print $2; exit }' "$_pane_id_map" 2>/dev/null)"
+  if [ -n "$_pane_id" ] && [ -s "${launch_dir}/${_pane_id#%}" ]; then
+    _b64="$(base64 < "${launch_dir}/${_pane_id#%}" 2>/dev/null | tr -d '\n')"
+    if [ -n "$_b64" ]; then
+      printf '%s\t%s\t;CLAUDE_CMD=%s\n' "$line_type" "$rest" "$_b64"
+      continue
+    fi
+  fi
+
+  printf '%s\t%s\n' "$line_type" "$rest"
 done < "$SNAPSHOT_FILE" > "$tmp"
 
 mv "$tmp" "$SNAPSHOT_FILE"
-rm -f "$declare_map_file"
+rm -f "$declare_map_file" "$_pane_id_map"
 # Drop the temp-cleanup trap (temps already cleaned) and run the exit chain
 # once, explicitly, against the now-enriched snapshot.
 trap - EXIT

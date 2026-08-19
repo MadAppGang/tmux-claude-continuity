@@ -199,15 +199,15 @@ assert_log_has  "claude pane resumed" "resume=session-ccc"
 # The zsh row (no SID, full_cmd != claude) must never be written.
 assert_log_lacks "zsh pane not written as bare" "zsh"
 
-# ── Test 5: custom claude-cmd qualifies a non-'claude' pane name ─────────────
-echo "Test 5: custom @claude-continuity-claude-cmd qualifies the pane"
+# ── Test 5: a row with a RECORDING qualifies, whatever it is named ──────────
+# @claude-continuity-claude-cmd is gone, and with it the "does this row match
+# the configured command" qualification. A row now qualifies on its own
+# recording, which is what lets any program — not just Claude — be restored.
+echo "Test 5: a recorded command qualifies a non-claude pane"
 _fresh_server 1
-_t set-option -g @claude-continuity-claude-cmd "myalias"
-# full_cmd is 'myalias' (not 'claude') and there is NO SID: the pane qualifies
-# ONLY via the claude-cmd match, exercising that fallback. It resumes bare.
-_row_from_live 1 myalias > "$RESURRECT_FILE"
+_row_from_live 1 myprogram | sed "s|$|	;CLAUDE_CMD=$(printf %s 'myprogram --serve' | base64 | tr -d '\n')|" > "$RESURRECT_FILE"
 _run_restore
-assert_log_has "custom-cmd pane written" "bare (no token)"
+assert_log_has "recorded non-claude pane written" "bare (no token)"
 
 # ── Results ──────────────────────────────────────────────────────────────────
 echo ""

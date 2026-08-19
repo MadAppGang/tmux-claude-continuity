@@ -132,7 +132,7 @@ _cc_claudish_replay() {
 # Decides, once, what goes into a pending-resume file — for a reboot restore and
 # for a thaw alike, so the two can never diverge (FR2.2).
 #
-#   cc_compose_relaunch <claude_cmd> <claudish_cmd> <typed_b64> <full_cmd> \
+#   cc_compose_relaunch <claudish_cmd> <typed_b64> <full_cmd> \
 #                       <claudish_replay> <resume_token>
 #
 # Prints the command line. Also sets _CC_RELAUNCH_KIND for the log — that one
@@ -151,38 +151,32 @@ cc_compose_relaunch() {
   printf '%s' "${out#*	}"
 }
 
-# Drop from <args> any VALUELESS long flag that <base> already supplies.
+# Collapse REPEATED valueless long flags to a single occurrence.
 #
-# WHY. The plain-claude path composes `$base_cmd $args`, where base_cmd is the
-# configured launcher (`claude --dangerously-skip-permissions`, or an alias that
-# expands to it) and args are the snapshot row's own arguments — which contain
-# that same flag, because the row was itself produced by a previous relaunch.
-# The flag therefore appears twice. The next save captures BOTH copies, the next
-# restore carries both across on top of base_cmd again, and the count grows by
-# one every cycle. Measured on this machine: 21 live Claude processes were
-# running with `--dangerously-skip-permissions` repeated FOUR times, and 19
-# snapshot rows recorded it four times. Left alone it grows without bound and
-# pollutes every future snapshot.
+# The base_cmd rebuild that used to cause flag growth is gone, so nothing
+# accumulates any more — but the rows it already wrote are still out there. Half
+# this machine's snapshot carried --dangerously-skip-permissions FOUR times, and
+# a pure replay would preserve all four forever. Deduping on the way out heals
+# them on the next cycle instead of freezing the damage in place.
 #
-# Only VALUELESS flags are dropped. A flag that takes a value is repeatable with
-# different values (`--add-dir a --add-dir b`), and removing one occurrence
-# would silently discard its value and shift the next token into a flag
-# position. A token counts as valueless only when the token that follows it is
-# absent or is itself an option, so `--model sonnet` is never touched.
-_cc_drop_flags_already_in() { # <base> <args> -> args with base's own flags removed
-  local base="$1" out="" tok next
-  set -- $2
+# Only VALUELESS flags are collapsed. A flag that takes a value is legitimately
+# repeatable with different values (`--add-dir a --add-dir b`), and dropping an
+# occurrence would discard its value and shift the next token into a flag
+# position. A token counts as valueless only when what follows is absent or is
+# itself an option, so `--model sonnet` is never touched.
+_cc_dedupe_valueless_flags() {
+  local out="" seen=" " tok next
+  set -- $1
   while [ "$#" -gt 0 ]; do
     tok="$1"; shift
     next="${1:-}"
     case "$tok" in
-      --*=*) ;;                      # carries its own value — always keep
+      --*=*) ;;                       # carries its own value — always keep
       --*)
         case "$next" in
-          ''|-*)                     # valueless: nothing or another option follows
-            case " $base " in
-              *" $tok "*) continue ;;    # base already supplies it
-            esac ;;
+          ''|-*)                      # valueless: nothing or another option follows
+            case "$seen" in *" $tok "*) continue ;; esac
+            seen="$seen$tok " ;;
         esac ;;
     esac
     out="$out $tok"
@@ -192,12 +186,16 @@ _cc_drop_flags_already_in() { # <base> <args> -> args with base's own flags remo
 
 # kind <TAB> command
 cc_compose_relaunch_kv() {
-  local base_cmd="$1" claudish_cmd="$2" typed_b64="$3" full_cmd="$4" \
-        claudish_replay="$5" resume_token="$6"
-  local relaunch typed stripped args
+  local claudish_cmd="$1" typed_b64="$2" full_cmd="$3" \
+        claudish_replay="$4" resume_token="$5"
+  local relaunch typed
 
-  relaunch="$base_cmd"
-  _CC_RELAUNCH_KIND="default"
+  # No configured-launcher default any more. A pane comes back as what it WAS:
+  # its own recording, or failing that its own captured command. Nothing is
+  # rebuilt onto a launcher declared elsewhere, so a pane launched from a script
+  # returns exactly as the script launched it rather than being silently upgraded.
+  relaunch=""
+  _CC_RELAUNCH_KIND="none"
 
   # PREFERRED: the command the user actually typed, captured by the preexec
   # hook. Nothing is reconstructed — the alias is still an alias, the quoting is
@@ -214,22 +212,35 @@ cc_compose_relaunch_kv() {
     relaunch="$(_cc_strip_session_flags "$typed")"
     _CC_RELAUNCH_KIND="typed:$relaunch"
   elif [ -n "$full_cmd" ] && _cc_is_claude_launcher "$full_cmd" && _cc_is_safe_to_eval "$full_cmd"; then
-    stripped="$(_cc_strip_session_flags "$full_cmd")"
-    if _cc_is_plain_claude "$full_cmd"; then
-      # Keep the configured launcher (it carries the env wrapper), add the
-      # pane's own arguments.
-      args="$(_cc_args_after_exec "$stripped")"
-      # …minus anything the configured launcher already supplies, or the flag
-      # accumulates one extra copy per restore cycle (see the helper above).
-      args="$(_cc_drop_flags_already_in "$base_cmd" "$args")"
-      if [ -n "$args" ]; then
-        relaunch="$base_cmd $args"
-        _CC_RELAUNCH_KIND="default+args:$args"
-      fi
-    else
-      relaunch="$stripped"
-      _CC_RELAUNCH_KIND="replay:$relaunch"
-    fi
+    # Replay the row's own command, plain or wrapped alike. The plain-claude case
+    # used to be rebuilt as `$base_cmd $args` so it inherited the configured
+    # launcher's env wrapper; that is exactly the behaviour being retired.
+    #
+    # Retiring it also removes the flag-accumulation bug at the root instead of
+    # patching it. `$base_cmd $args` duplicated every valueless flag the base
+    # already supplied, each restore's output became the next save's input, and
+    # the count grew by one per cycle — measured at FOUR copies of
+    # --dangerously-skip-permissions on 21 live processes. A replay carries the
+    # snapshot's flags exactly once, so there is nothing to accumulate and
+    # _cc_drop_flags_already_in has no caller left.
+    relaunch="$(_cc_dedupe_valueless_flags "$(_cc_strip_session_flags "$full_cmd")")"
+    _CC_RELAUNCH_KIND="replay:$relaunch"
+  fi
+
+  # A row carrying a resume token was, by construction, a Claude pane: pre_save
+  # writes that sentinel only for panes its process walk identified as one. So
+  # when there is no recording and no captured command we are willing to execute,
+  # `claude` is not a guess — it is the one thing about the row we actually know.
+  #
+  # Deliberately NOT configurable. This is the PROGRAM, not a preference about
+  # how to launch it, which is the distinction @claude-continuity-claude-cmd
+  # blurred: it let a launcher declared in tmux.conf be pasted over every pane
+  # that failed to identify itself, which is how it ended up carrying 100% of
+  # relaunches while the recording path was quietly broken. A pane with a
+  # recording still replays its own launcher, wrapper and all.
+  if [ -z "$relaunch" ] && [ -n "$resume_token" ]; then
+    relaunch="claude"
+    _CC_RELAUNCH_KIND="sid-only"
   fi
 
   if [ -n "$claudish_replay" ] && [ -n "$resume_token" ]; then
@@ -240,6 +251,13 @@ cc_compose_relaunch_kv() {
     # injected by _cc_claudish_replay).
     _CC_RELAUNCH_KIND="claudish:[$claudish_replay]"
     printf '%s\t%s %s --resume %s' "$_CC_RELAUNCH_KIND" "$claudish_cmd" "$claudish_replay" "$resume_token"
+  elif [ -z "$relaunch" ]; then
+    # Nothing to replay: no recording, and no captured command we are willing to
+    # execute. With the configured-launcher default gone there is no longer
+    # anything to fall back ONTO, so emit nothing and let the caller skip the
+    # row. Emitting just `--resume <sid>` here would be a command with no program.
+    _CC_RELAUNCH_KIND="none"
+    printf '%s\t' "$_CC_RELAUNCH_KIND"
   elif [ -n "$resume_token" ]; then
     printf '%s\t%s --resume %s' "$_CC_RELAUNCH_KIND" "$relaunch" "$resume_token"
   else

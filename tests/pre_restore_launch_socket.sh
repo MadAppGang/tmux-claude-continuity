@@ -49,7 +49,10 @@ FP_BEFORE="$(fp)"
 mkdir -p "$TD/launch" "$TD/pending" "$TD/bin" "$TD/zdot"
 
 # A fake claude, so the alias resolves as a Claude launcher and running it is inert.
-printf '#!/bin/sh\nexit 0\n' > "$TD/bin/claude"; chmod +x "$TD/bin/claude"
+# Long-running on purpose. A fake claude that exits immediately would have its
+# recording cleared by the precmd hook before this test could observe it — the
+# recording exists only WHILE a command runs, which is the whole invariant.
+printf '#!/bin/sh\nsleep 120\n' > "$TD/bin/claude"; chmod +x "$TD/bin/claude"
 
 # A private zsh rc that installs exactly what the hook needs: the alias whose
 # text names claude (that is what _claude_continuity_record classifies on), and
@@ -58,6 +61,11 @@ cat > "$TD/zdot/.zshrc" <<EOF
 export PATH="$TD/bin:\$PATH"
 alias c='claude --dangerously-skip-permissions'
 source "$HOOK"
+# Readiness marker. send-keys into a shell that is still sourcing .zshrc is
+# silently dropped, which on a loaded machine looks exactly like "the hook
+# never recorded". Waiting for this makes the handshake deterministic
+# instead of a sleep that is long enough only sometimes.
+: > "$TD/ready-${TMUX_PANE#%}"
 EOF
 
 echo "=== pre_restore.sh — real tmux socket ($SOCKET) ==="
@@ -104,12 +112,9 @@ fi
 # directly from new-window rather than guessing which pane is which.
 PANE="$(_tmux new-window -t t -c "$TD" -P -F '#{pane_id}' "ZDOTDIR=$TD/zdot zsh" 2>/dev/null)"
 KEY="${PANE#%}"
-sleep 1
+for _ in $(seq 1 60); do [ -e "$TD/ready-$KEY" ] && break; sleep 0.5; done
 _tmux send-keys -t "$PANE" 'c' C-m 2>/dev/null
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-  [ -f "$TD/launch/$KEY" ] && break
-  sleep 0.4
-done
+for _ in $(seq 1 40); do [ -s "$TD/launch/$KEY" ] && break; sleep 0.5; done
 
 if [ -f "$TD/launch/$KEY" ]; then
   ok "a real zsh pane records its typed command via preexec ($(cat "$TD/launch/$KEY"))"

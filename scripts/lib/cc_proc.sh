@@ -226,6 +226,24 @@ _cc_tombstone_shell() {
   esac
 }
 
+# What a thawed pane is respawned WITH, before any resume is queued into it.
+# MOVED here from cc_thaw.sh:324, unchanged, for the same reason
+# cc_compose_relaunch was moved into cc_relaunch.sh: the popup has to be able to
+# show the command a wake will actually run, and a second copy of this decision
+# in the previewer is a copy that drifts. A pane with no recorded session gets
+# THIS and nothing else — no pending file is written for it — so for such a pane
+# this string, plus the recorded cwd, is the whole restore.
+#
+# Unlike _cc_tombstone_shell above, `default-command` IS honoured here: this is
+# what tmux itself would run for a new pane, and a thawed pane that ignored it
+# would come back in a different shell from every other pane on the server.
+_cc_fresh_shell() {
+  local s
+  s="$($TMUX_CMD show-option -gqv default-command 2>/dev/null)"
+  [ -n "$s" ] || s="$(_cc_shquote "$(_cc_tombstone_shell)") -l"
+  printf '%s' "$s"
+}
+
 # ── Capture: the descendant set of every pane, classified ────────────────────
 # Args: <ps_file> <pane_table_file>
 #   pane table:  <pane_index>\t<pane_id>\t<pane_pid>
