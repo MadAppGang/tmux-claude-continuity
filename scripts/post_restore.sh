@@ -541,8 +541,17 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   # server, htop, psql and Claude all qualify on the same terms, and a completed
   # one-shot never reaches here because its recording was cleared before the save.
   #
-  # This is what makes @claude-continuity-restore-procs' allowlist redundant:
-  # nothing has to be named in advance.
+  # This retires @claude-continuity-restore-procs for anything launched from a
+  # hooked interactive shell — which is nearly everything — because a recording
+  # is exact, carries its own quoting, and is the user's own typed line rather
+  # than scraped ps text. The allowlist existed because ps supplied none of
+  # that: it routinely captured a pane's MCP child instead of the program, and
+  # the flattened string it produced then gets eval'd, so naming what you
+  # trusted was the only safe way to widen the net.
+  #
+  # It is NOT fully redundant. A non-Claude program started WITHOUT a hooked
+  # shell — `tmux new-window 'btop'`, or a script — never reaches preexec, has
+  # no recording, and still needs the allowlist to be relaunched at all.
   if [ -z "$resume_token" ] && [ -z "$restore_proc_cmd" ] && [ -z "$typed_cmd_b64" ] \
      && [[ "$full_cmd" != *"claude"* ]]; then
     continue
