@@ -111,3 +111,30 @@ if [ -n "$custom_title" ]; then
 else
   echo "$session_id" > "${by_pid_dir}/${PPID}.session-id"
 fi
+
+# ── Tab colour / name (lifecycle 6.1) ─────────────────────────────────────────
+# Announce "this session exists" to the ONE consumer that paints the tmux window
+# tab. This script stays ignorant of tabs: cc_tab_reconcile.sh recomputes the
+# whole answer for this pane's window from the session records plus a live pane
+# inventory. It is idempotent, so a duplicate announcement costs nothing — which
+# is what makes it safe to fire this from here AND from the Stop hook AND from
+# tmux's own pane hooks.
+#
+# Backgrounded and fully redirected: a Claude hook must never block on it, and a
+# hook that writes to stdout confuses the client.
+#
+# TMUX_PANE is REQUIRED, not optional. A Claude session running outside tmux
+# still resolves a target with an empty `-t`, because tmux reads that as "the
+# active pane of the current client" — which is how a non-tmux session once
+# claimed a live pane's sidecar (see the note further up this file). The same
+# trap would have it repaint whatever window the user happens to be looking at.
+#
+# The delay is deliberate: at SessionStart Claude has not necessarily written
+# ~/.claude/sessions/<pid>.json yet, and reconciling before the record exists
+# paints the window as "no Claude here". The Stop hook repairs that within one
+# turn regardless; the delay just makes the first attempt the correct one.
+_cc_tab_reconcile="$(dirname "$0")/cc_tab_reconcile.sh"
+if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] && [ -x "$_cc_tab_reconcile" ]; then
+  ( sleep "${CC_TAB_RECONCILE_DELAY:-1}"
+    "$_cc_tab_reconcile" "$TMUX_PANE" ) >/dev/null 2>&1 &
+fi

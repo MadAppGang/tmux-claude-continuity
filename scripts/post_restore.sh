@@ -955,3 +955,25 @@ if [ -n "$_cc_ns" ] && type cc_ledger_seed >/dev/null 2>&1; then
 fi
 
 _cc_log "post_restore DONE: wrote $_cc_written pending resume file(s), $_cc_proc_written extra process(es), re-claimed $_cc_frozen_claimed frozen entry(ies)"
+
+# ── Tab colour / name (lifecycle 6.6) — the last act ──────────────────────────
+# tmux-resurrect does NOT persist window options. Every tab therefore comes back
+# UNCOLOURED and UNNAMED after a restore, whatever it looked like before, and
+# something has to repaint it.
+#
+# Two independent paths do, and both are wanted: each restored pane's own
+# SessionStart hook repaints its window as Claude relaunches, and this --all
+# pass covers the windows whose Claude did NOT come back (clearing them) plus
+# the window of any Claude that survived the restore. Belt and braces is free
+# here precisely because the reconciler is idempotent — the two paths compute
+# the same answer and the second one writes nothing.
+#
+# Synchronous, not backgrounded: it is two tmux reads, one jq and one awk, and
+# running it inline keeps its outcome inside this hook's own log.
+_cc_tab_reconcile="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/cc_tab_reconcile.sh"
+if [ -x "$_cc_tab_reconcile" ]; then
+  TMUX_CMD="$TMUX_CMD" "$_cc_tab_reconcile" --all >/dev/null 2>&1 || true
+  _cc_log "tab reconcile: --all (window options are not persisted by resurrect)"
+else
+  _cc_log "tab reconcile: $_cc_tab_reconcile is not executable — tabs left unpainted"
+fi

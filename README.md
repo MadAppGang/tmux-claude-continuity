@@ -183,6 +183,127 @@ set -g @claude-continuity-claude-cmd "claude"
 
 ---
 
+## Window tab colour and name
+
+The plugin can colour a tmux window tab after the Claude session running in it,
+and put that session's name on the tab. It writes two **window options**; the
+look itself lives in your `tmux.conf`, so the plugin never owns your status bar.
+
+```
+~/.claude/sessions/*.json        tmux list-panes -a
+(written by Claude itself)       (pane -> window, pane_index)
+          |                              |
+          +--------------+---------------+
+                         v
+            scripts/cc_tab_reconcile.sh        <- the ONE consumer
+                         v
+        tmux set -w @cc_colour <token> / @cc_name <text>
+                         v
+        window-status-format  (your tmux.conf, resolved at draw time)
+```
+
+### The options
+
+| Option | Scope | Written by | Values |
+|---|---|---|---|
+| `@cc_colour` | window | the plugin | `red` `orange` `yellow` `green` `cyan` `blue` `purple` `pink` `default` |
+| `@cc_colour_pin` | window | **you** | the same tokens — a manual override that always wins |
+| `@cc_name` | window | the plugin | the owning session's name, or unset |
+| `@cc_tab_name_source` | global | you | `window` \| `user` (default) \| `session` |
+
+`@cc_colour` holds a **token, never a hex**. Your format string maps the token
+to a colour at draw time, so switching theme re-skins every coloured tab with no
+per-window work and no drift.
+
+### Who colours the tab when a window holds several Claude sessions
+
+The **live session at the lowest `pane_index` in the window** — derived from the
+live pane inventory, not from a hardcoded index, so it is correct whatever your
+`pane-base-index` is and survives `swap-pane`, `move-pane` and renumbering. When
+that pane closes and another Claude remains, ownership transfers and the tab
+recolours. Secondary sessions are deliberately not shown: the tab discriminates
+between *windows*, and `pane_title` already discriminates between panes.
+
+A record paints a tab only if its process is alive **and** its pane still
+exists, so a stale record can never leave a colour behind.
+
+### Precedence
+
+1. `@cc_colour_pin` on the window — your choice, always wins.
+2. Otherwise the owning session's own colour, if it has one.
+3. Otherwise `default`.
+
+### Where the session colour comes from
+
+The colour you set with `/color` is persisted by Claude Code in the **session
+transcript**, `~/.claude/projects/<slug>/<sessionId>.jsonl`, as its own record:
+
+```json
+{"type":"agent-color","agentColor":"purple","sessionId":"d2e5f013-…"}
+```
+
+**Last record wins**, so `/color green` then `/color purple` gives purple. A
+session that never ran `/color` has *no* such record — on this machine that is
+2,961 of 2,991 transcripts, and 29 of 33 live sessions. That case is "**no
+opinion**", not "no colour": step 2 above abstains and a pin you set by hand
+survives every reconcile, for ever.
+
+The transcript is found by **globbing** for `<sessionId>.jsonl` under
+`~/.claude/projects/*/`, not by deriving the directory from the session's `cwd`.
+A computed directory is tried first as a fast path and accepted only if the file
+is really there — the derivation is right 95.9% of the time, and worktree
+sessions are the gap (some are filed under the parent repo, some under their own
+path, depending on the Claude Code version). A wrong guess would be a silently
+uncoloured tab, so the glob is the authority.
+
+Reading is bounded. The newest record sits near EOF, so a 200 KB tail window
+answers almost every lookup; a miss escalates to a larger, capped scan, and what
+has already been read is remembered — a transcript is append-only, so bytes once
+scanned never change. This matters: transcripts here run to 655 MB, and an
+unbounded rescan on every Claude turn would cost seconds.
+
+`scripts/lib/cc_colour.sh` is the single place that names any of this. A value
+it cannot read is logged once and otherwise ignored, so a schema change can
+never produce a *wrong* colour — only a missing one.
+
+### Names (`@cc_tab_name_source`)
+
+- `window` — never write `@cc_name`; tabs keep their tmux names.
+- `user` — **the default.** Write the session's name only when *you* named the
+  session (`nameSource == "user"`). Claude's own derived names are things like
+  `dotfiles-27`; your window names are usually better, so they are not replaced.
+- `session` — always show the owning session's name.
+
+Names are stripped of `#` and control characters and capped at 64 characters
+before they reach a tmux option.
+
+### What triggers a repaint
+
+| When | What fires |
+|---|---|
+| a session starts or resumes | the `SessionStart` hook, for its own window |
+| after every Claude turn | the `Stop` hook — this is what catches renames, at no extra cost |
+| a pane exits, or is killed | `pane-exited` / `after-kill-pane` hooks in your `tmux.conf`, `--all` |
+| after a resurrect restore | `post_restore.sh`, `--all` (tmux-resurrect does **not** persist window options, so every tab starts uncoloured) |
+| theme toggle | nothing — the option holds a token, your formats resolve the colour |
+
+Every trigger runs the same script, so the full list of things that can paint a
+tab is `grep -rl cc_tab_reconcile`. It recomputes from scratch every time and
+writes only what changed, so running it five times equals running it once.
+
+### Running it by hand
+
+```sh
+~/.tmux/plugins/tmux-claude-continuity/scripts/cc_tab_reconcile.sh --all
+~/.tmux/plugins/tmux-claude-continuity/scripts/cc_tab_reconcile.sh @8    # one window
+~/.tmux/plugins/tmux-claude-continuity/scripts/cc_tab_reconcile.sh %14   # that pane's window
+```
+
+`CC_TAB_DEBUG=1` prints the plan it computed to stderr without changing what it
+writes.
+
+---
+
 ## Freeze / thaw (`prefix + Z`)
 
 A stale pane costs the same memory as a live one. Claude and its MCP children
