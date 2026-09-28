@@ -191,6 +191,13 @@ for sidecar in "${panes_dir}"/*.session-id; do
 done
 
 _cc_written=0
+# Manifest of armed panes for the post-launch check (verify_launch.sh). Not kept
+# for a diagnostic run (CC_NO_NUDGE: nothing is launched, so there is nothing to
+# verify) or when CC_VERIFY_LAUNCH=0.
+_cc_manifest=""
+if [ "${CC_NO_NUDGE:-0}" != "1" ] && [ "${CC_VERIFY_LAUNCH:-1}" != "0" ]; then
+  _cc_manifest="$(mktemp "${TMPDIR:-/tmp}/cc-launch-manifest.XXXXXX" 2>/dev/null)" || _cc_manifest=""
+fi
 _cc_considered=0        # rows that PASSED the Claude/restore-proc filter — the only
                         # population the numerator and the skip counters are drawn
                         # from, and therefore the only valid denominator
@@ -717,6 +724,18 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   fi
   _cc_written=$((_cc_written + 1))
 
+  # One manifest row per armed pane for verify_launch.sh, which looks at the pane
+  # after the relaunch had time to happen. Writing the pending file proves only
+  # that a command was QUEUED; a command the pane's shell cannot run fails later,
+  # out of this script's sight (the 2026-09-26 `wt` panes, all under a PASS).
+  # A row with a resume token must come back as claude; anything else only has
+  # to come back as something other than a shell.
+  if [ -n "$_cc_manifest" ]; then
+    printf '%s\t%s\t%s\t%s\t%s\n' "$pane_id" "$pane_target" \
+      "$([ -n "$resume_token" ] && [ -z "$restore_proc_cmd" ] && echo claude || echo proc)" \
+      "${resume_token:--}" "$(printf '%s' "$pane_title" | tr '\t' ' ')" >> "$_cc_manifest" 2>/dev/null
+  fi
+
   # Nudge the pane so the armed precmd hook fires now. Two orderings to cover:
   #   - shell still sourcing .zshrc: the file is already written, so its first
   #     prompt consumes it; this Enter lands on a not-yet-ready shell and is
@@ -959,6 +978,21 @@ if [ -n "$_cc_ns" ] && type cc_ledger_seed >/dev/null 2>&1; then
 fi
 
 _cc_log "post_restore DONE: wrote $_cc_written pending resume file(s), $_cc_proc_written extra process(es), re-claimed $_cc_frozen_claimed frozen entry(ies)"
+
+# ── Launch verification — detached ───────────────────────────────────────────
+# The BOOT VERDICT above certifies what was QUEUED. verify_launch.sh certifies
+# what came BACK, by looking at every armed pane once the relaunches had time to
+# run, and writes its own LAUNCH VERDICT line (and the status-line warning on a
+# failure). Detached, with its output closed, so this hook returns now.
+if [ -n "$_cc_manifest" ]; then
+  if [ -s "$_cc_manifest" ] && [ -x "$(dirname "$0")/verify_launch.sh" ]; then
+    _cc_log "launch verify: watching $(grep -c . "$_cc_manifest") armed pane(s) in the background, its verdict follows"
+    TMUX_CMD="$TMUX_CMD" nohup "$(dirname "$0")/verify_launch.sh" "$_cc_manifest" \
+      </dev/null >/dev/null 2>&1 &
+  else
+    rm -f "$_cc_manifest"
+  fi
+fi
 
 # ── Tab colour / name (lifecycle 6.6) — the last act ──────────────────────────
 # tmux-resurrect does NOT persist window options. Every tab therefore comes back

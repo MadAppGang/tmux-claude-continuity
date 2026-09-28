@@ -486,6 +486,19 @@ with `prefix + Z` → `Ctrl-W`.
 
 ## Troubleshooting
 
+### Did the last restore work?
+
+Every restore writes two verdicts to `~/.tmux/scripts/claude-continuity-restore.log`:
+
+```bash
+grep -E 'BOOT VERDICT|LAUNCH VERDICT' ~/.tmux/scripts/claude-continuity-restore.log | tail -2
+```
+
+- `BOOT VERDICT` is written as soon as the restore hook finishes. It says how many sessions were **queued** for relaunch.
+- `LAUNCH VERDICT` comes a few minutes later, from `verify_launch.sh`, which checks each queued pane. It says how many sessions actually **came back**. A queued command can still fail in the pane: a wrapper that rejects `--resume`, a trust refusal, a missing binary. A pane that did not come back is logged as `LAUNCH EXITED` (with its last lines of output, which usually show why), `NOT-FIRED`, `STALLED` or `GONE`. On a failure the status line shows `@claude-continuity-boot-warning`.
+
+A command you typed is replayed with `--resume <session-id>` added to the end, so a shell function or script that launches Claude must accept that flag.
+
 ### Sessions not resuming after restore
 
 Check whether the sidecar files exist:
