@@ -676,10 +676,12 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
   # `claude --resume` would replay the transcript against the REAL Anthropic API
   # — wrong account, wrong model.
   #
-  # Called with a REDIRECT, never in `$( )`: a command substitution would run it
-  # in a subshell and discard _CC_RELAUNCH_KIND, and that one string is the
-  # difference between reading a log and re-deriving a wrong relaunch from ps.
-  # The trailing newline is written separately for the same reason.
+  # Called as the _kv form and split here: a command substitution runs it in a
+  # subshell and discards the _CC_RELAUNCH_KIND it sets, and that one string is
+  # the difference between reading a log and re-deriving a wrong relaunch from
+  # ps. Calling the plain form in `$( )` logged a stale "cmd=default" on every
+  # WROTE line — which hid that four `wt` panes were being relaunched from a
+  # typed line wt could not parse.
   if [ -n "$restore_proc_cmd" ]; then
     # Non-Claude program (codex, lazygit, …): relaunch its full saved command
     # through the same pending-file path, so it is subject to no send-keys race.
@@ -687,8 +689,10 @@ while IFS=$'\t' read -r line_type session win win_active win_flags pane_idx \
     _cc_log "WROTE $pane_target -> $pane_id ($match_kind, '$pane_title') proc=[$restore_proc_cmd]"
     _cc_proc_written=$((_cc_proc_written + 1))
   else
-    _relaunch_cmd="$(cc_compose_relaunch "$claudish_cmd" "$typed_cmd_b64" "$full_cmd" \
+    _relaunch_cmd="$(cc_compose_relaunch_kv "$claudish_cmd" "$typed_cmd_b64" "$full_cmd" \
         "$claudish_replay" "$resume_token")"
+    _CC_RELAUNCH_KIND="${_relaunch_cmd%%	*}"
+    _relaunch_cmd="${_relaunch_cmd#*	}"
 
     # Nothing identifiable to bring back. With the configured-launcher default
     # gone there is no longer anything to fall back ONTO, so a row with no
